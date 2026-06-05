@@ -17,17 +17,19 @@
 - 🌐 Обратное геокодирование (показывает страну/город)
 
 ### 2. Desktop App (Steam / Любое приложение)
-Python-приложение для анализа экрана с помощью OCR и визуальных эвристик.
+Python-приложение с двумя режимами работы.
 
-**Возможности:**
+**Proxy Mode (рекомендуется) — 100% точность:**
+- 🎯 Перехват запросов к Google Maps через локальный прокси
+- 🌍 Показывает точный город/страну в прозрачном оверлее
+- 🗺️ Ссылка на Google Maps
+- 🔄 Автоматическое обновление при смене раунда
+
+**Visual Mode (fallback) — без прокси:**
 - 📷 Захват экрана по горячей клавише (Ctrl+Shift+G)
-- 🔤 OCR распознавание текста (вывески, знаки, номера)
-- 🌐 Определение языка → страна
-- 🛑 Анализ дорожных знаков и маркеров
-- 📞 Распознавание телефонных кодов
-- 🌐 Поиск доменных имен
-- 🎨 Анализ визуальных особенностей (цвет почвы, растительность)
-- 🚗 Определение стороны движения
+- 🔤 OCR распознавание текста (опционально)
+- 🎨 Визуальный анализ (цвет почвы, растительность, разметка)
+- 🌐 Определение языка, доменов, телефонных кодов
 
 ---
 
@@ -54,52 +56,72 @@ Python-приложение для анализа экрана с помощью
 > ```
 > Затем установите через `about:addons` → "Установить дополнение из файла"
 
-### Desktop App (для Steam)
+### Desktop App — Proxy Mode (для Steam, 100% точность)
+
+Перехватывает сетевые запросы GeoGuessr к Google Maps и извлекает точные координаты.
 
 **Требования:**
 - Python 3.10+
-- Tesseract OCR
+- mitmproxy (`pip install mitmproxy`)
 
-**Linux:**
+**Быстрый старт (Windows):**
+```
+1. Дважды кликните start_solver.bat
+2. При первом запуске установите сертификат mitmproxy:
+   - Откройте http://mitm.it в браузере
+   - Скачайте и установите сертификат для Windows
+3. Запустите GeoGuessr в Steam — координаты появятся в оверлее
+```
+
+**Ручная установка:**
 ```bash
-sudo apt-get install tesseract-ocr tesseract-ocr-rus tesseract-ocr-jpn tesseract-ocr-kor
+pip install mitmproxy requests Pillow pynput
 cd desktop-app
-pip install -r requirements.txt
+python proxy_solver.py
+```
+
+**Настройка прокси вручную:**
+- Windows: Параметры → Сеть → Прокси → Вкл → `127.0.0.1:8082`
+- Или bat-файл сделает это автоматически
+
+### Desktop App — Visual Mode (без прокси, менее точно)
+
+Анализирует скриншоты через OCR и визуальные эвристики. Не требует настройки прокси, но точность значительно ниже.
+
+**Установка:**
+```bash
+pip install Pillow pynput mss requests
+cd desktop-app
 python main.py
 ```
 
-**Windows:**
+**Опционально для OCR (лучшая точность):**
 ```bash
-# Установите Tesseract: https://github.com/UB-Mannheim/tesseract/wiki
-# Добавьте в PATH
-
-cd desktop-app
-pip install -r requirements.txt
-python main.py
-```
-
-**macOS:**
-```bash
-brew install tesseract tesseract-lang
-cd desktop-app
-pip install -r requirements.txt
-python main.py
+pip install pytesseract
+# + Tesseract: https://github.com/UB-Mannheim/tesseract/wiki (Windows)
+# + sudo apt install tesseract-ocr (Linux)
 ```
 
 ---
 
 ## Использование
 
-### Chrome Extension
-1. Установите расширение
+### Browser Extension (Chrome/Firefox)
+1. Установите расширение (см. выше)
 2. Откройте игру на [geoguessr.com](https://www.geoguessr.com)
-3. Координаты будут отображаться автоматически в оверлее и в popup расширения
+3. Координаты и город/страна отображаются автоматически в оверлее
 
-### Desktop App
+### Desktop — Proxy Mode (рекомендуется для Steam)
+1. Запустите `start_solver.bat` (или `python proxy_solver.py`)
+2. Настройте прокси (bat делает это автоматически)
+3. Откройте GeoGuessr в Steam
+4. Оверлей покажет точный город/страну поверх игры
+5. ПКМ на оверлее — закрыть, ЛКМ — перетащить
+
+### Desktop — Visual Mode (fallback)
 1. Запустите `python main.py`
-2. Откройте GeoGuessr (Steam или браузер)
-3. Нажмите **Ctrl+Shift+G** или кнопку "Scan Now"
-4. Результат появится в окне приложения
+2. Нажмите **Ctrl+Shift+G** или кнопку "Start"
+3. Результат появится в оверлее поверх игры
 
 ---
 
@@ -111,16 +133,22 @@ python main.py
 - Пытается напрямую обратиться к Google Maps Panorama объекту
 - Отображает координаты в оверлее на странице
 
-### Desktop App
+### Desktop — Proxy Mode (рекомендуется)
+- Запускает локальный HTTPS-прокси (mitmproxy) на порту 8082
+- Перехватывает запросы GeoGuessr к Google Maps API
+- Извлекает точные координаты из ответов
+- Обратное геокодирование → показывает город/страну
+- **100% точность** — те же данные, что браузерное расширение
+
+### Desktop — Visual Mode (fallback)
 Анализирует скриншот по нескольким параметрам:
 
 | Метод | Точность | Описание |
 |-------|----------|----------|
-| OCR + язык | Высокая | Определяет язык текста на вывесках |
-| Текстовые маркеры | Высокая | STOP/PARE/ALTO, названия улиц |
-| Домены | Очень высокая | .ru, .br, .jp на вывесках |
-| Телефоны | Высокая | Код страны +7, +1, +44 |
-| Визуальные | Низкая | Цвет почвы, растительность |
+| OCR + язык | Средняя | Определяет язык текста на вывесках |
+| Текстовые маркеры | Средняя | STOP/PARE/ALTO, названия улиц |
+| Домены | Высокая | .ru, .br, .jp на вывесках |
+| Визуальный анализ | Низкая | Цвет почвы, растительность, разметка |
 
 ---
 
@@ -141,7 +169,10 @@ geoguessr-solver/
 │   ├── popup.html / popup.js
 │   └── icons/
 ├── desktop-app/            # Python приложение (Steam)
-│   ├── main.py
+│   ├── proxy_solver.py     # Proxy Mode (100% точность)
+│   ├── proxy_addon.py      # mitmproxy addon
+│   ├── start_solver.bat    # Авто-запуск для Windows
+│   ├── main.py             # Visual Mode (fallback)
 │   ├── capture.py
 │   ├── analyzer.py
 │   ├── overlay.py
