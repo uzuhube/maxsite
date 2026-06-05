@@ -1,0 +1,166 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <style>
+    * {
+      margin: 0;
+      padding: 0;
+      box-sizing: border-box;
+    }
+    body {
+      width: 320px;
+      min-height: 200px;
+      background: #1a1a2e;
+      color: #eee;
+      font-family: 'Segoe UI', sans-serif;
+      padding: 16px;
+    }
+    .header {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      margin-bottom: 16px;
+      padding-bottom: 12px;
+      border-bottom: 1px solid #333;
+    }
+    .header h1 {
+      font-size: 16px;
+      color: #00ff88;
+    }
+    .status {
+      padding: 8px 12px;
+      border-radius: 6px;
+      margin-bottom: 12px;
+      font-size: 13px;
+    }
+    .status.waiting {
+      background: #2a2a3e;
+      color: #888;
+    }
+    .status.found {
+      background: #0a2a1a;
+      border: 1px solid #00ff88;
+      color: #00ff88;
+    }
+    .coords {
+      background: #0d1117;
+      border-radius: 8px;
+      padding: 12px;
+      margin-bottom: 12px;
+    }
+    .coord-row {
+      display: flex;
+      justify-content: space-between;
+      margin-bottom: 6px;
+      font-family: 'Courier New', monospace;
+    }
+    .coord-label {
+      color: #888;
+      font-size: 12px;
+    }
+    .coord-value {
+      color: #00ff88;
+      font-size: 14px;
+      font-weight: bold;
+    }
+    .country {
+      text-align: center;
+      font-size: 18px;
+      margin: 12px 0;
+      padding: 8px;
+      background: #2a2a3e;
+      border-radius: 6px;
+    }
+    .actions {
+      display: flex;
+      flex-direction: column;
+      gap: 8px;
+    }
+    .btn {
+      display: block;
+      width: 100%;
+      padding: 10px;
+      border: none;
+      border-radius: 6px;
+      font-size: 13px;
+      cursor: pointer;
+      text-align: center;
+      text-decoration: none;
+      transition: opacity 0.2s;
+    }
+    .btn:hover {
+      opacity: 0.8;
+    }
+    .btn-primary {
+      background: #00ff88;
+      color: #000;
+      font-weight: bold;
+    }
+    .btn-secondary {
+      background: #333;
+      color: #fff;
+    }
+    .btn-link {
+      background: #1a3a5c;
+      color: #4da6ff;
+    }
+    .footer {
+      margin-top: 16px;
+      padding-top: 12px;
+      border-top: 1px solid #333;
+      font-size: 11px;
+      color: #666;
+      text-align: center;
+    }
+    .hotkey {
+      background: #333;
+      padding: 2px 6px;
+      border-radius: 3px;
+      font-family: monospace;
+    }
+  </style>
+</head>
+<body>
+  <div class="header">
+    <h1>🌍 GeoGuessr Solver</h1>
+  </div>
+
+  <div id="status" class="status waiting">
+    Ожидание... Откройте игру GeoGuessr
+  </div>
+
+  <div id="coords-section" style="display:none;">
+    <div class="coords">
+      <div class="coord-row">
+        <span class="coord-label">Широта (Lat)</span>
+        <span class="coord-value" id="lat">—</span>
+      </div>
+      <div class="coord-row">
+        <span class="coord-label">Долгота (Lng)</span>
+        <span class="coord-value" id="lng">—</span>
+      </div>
+    </div>
+
+    <div id="country" class="country" style="display:none;"></div>
+
+    <div class="actions">
+      <a id="maps-link" class="btn btn-primary" href="#" target="_blank">
+        🗺️ Открыть в Google Maps
+      </a>
+      <button id="copy-btn" class="btn btn-secondary">
+        📋 Копировать координаты
+      </button>
+      <button id="toggle-overlay" class="btn btn-secondary">
+        👁️ Переключить оверлей
+      </button>
+    </div>
+  </div>
+
+  <div class="footer">
+    Расширение автоматически определяет координаты
+  </div>
+
+  <script src="popup.js"></script>
+</body>
+</html>
