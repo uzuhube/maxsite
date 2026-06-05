@@ -6,6 +6,8 @@ Works by:
 1. Capturing screen on hotkey press
 2. Analyzing the image using OCR and visual heuristics
 3. Showing city/country in a transparent overlay on top of the game
+
+Compatible with Python 3.14+
 """
 
 import sys
@@ -31,19 +33,25 @@ class GeoGuessrSolver:
         self.analyzer = LocationAnalyzer()
         self.overlay = None
         self.is_running = False
+        self._mainloop_started = False
 
         self._setup_ui()
-        self._setup_hotkey()
         self._create_overlay()
+
+        # Delay hotkey setup until after mainloop starts
+        self.root.after(100, self._setup_hotkey)
 
     def _create_overlay(self):
         """Create the transparent game overlay."""
-        self.overlay = ResultOverlay(self.root)
+        try:
+            self.overlay = ResultOverlay(self.root)
+        except Exception as e:
+            print(f"Warning: overlay creation failed: {e}")
 
     def _setup_ui(self):
         # Title
         title_frame = tk.Frame(self.root, bg="#1a1a2e")
-        title_frame.pack(fill="x", padx=20, pady=(20, 10))
+        title_frame.pack(fill="x", padx=20, pady=15)
 
         tk.Label(
             title_frame,
@@ -94,7 +102,7 @@ class GeoGuessrSolver:
             width=12,
             pady=8,
         )
-        self.start_btn.pack(side="left", padx=(0, 5))
+        self.start_btn.pack(side="left", padx=5)
 
         self.scan_btn = tk.Button(
             ctrl_frame,
@@ -109,15 +117,15 @@ class GeoGuessrSolver:
             width=12,
             pady=8,
         )
-        self.scan_btn.pack(side="right", padx=(5, 0))
+        self.scan_btn.pack(side="right", padx=5)
 
         # Overlay controls
         overlay_frame = tk.Frame(self.root, bg="#1a1a2e")
-        overlay_frame.pack(fill="x", padx=20, pady=(5, 0))
+        overlay_frame.pack(fill="x", padx=20, pady=5)
 
         tk.Label(
             overlay_frame,
-            text="Прозрачность оверлея:",
+            text="Прозрачность:",
             font=("Segoe UI", 9),
             fg="#888",
             bg="#1a1a2e",
@@ -128,7 +136,7 @@ class GeoGuessrSolver:
             from_=30,
             to=100,
             orient="horizontal",
-            length=150,
+            length=140,
             bg="#1a1a2e",
             fg="#00ff88",
             troughcolor="#333",
@@ -174,12 +182,12 @@ class GeoGuessrSolver:
             pady=10,
         )
         self.result_text.pack(fill="both", expand=True, padx=5, pady=5)
-        self.result_text.insert("1.0", "Ожидание сканирования...\n\nОверлей появится поверх игры.")
+        self.result_text.insert("1.0", "Ожидание сканирования...\n\nНажмите Start или Ctrl+Shift+G")
         self.result_text.config(state="disabled")
 
         # Footer
         footer = tk.Frame(self.root, bg="#1a1a2e")
-        footer.pack(fill="x", padx=20, pady=(0, 10))
+        footer.pack(fill="x", padx=20, pady=8)
 
         tk.Label(
             footer,
@@ -202,25 +210,35 @@ class GeoGuessrSolver:
             self.overlay.toggle()
 
     def _setup_hotkey(self):
-        """Setup global hotkey listener."""
-        from pynput import keyboard
+        """Setup global hotkey listener (called after mainloop starts)."""
+        self._mainloop_started = True
+        try:
+            from pynput import keyboard
 
-        def on_activate():
-            self.manual_scan()
+            def on_activate():
+                if self._mainloop_started:
+                    self.root.after(0, self.manual_scan)
 
-        hotkey = keyboard.HotKey(
-            keyboard.HotKey.parse("<ctrl>+<shift>+g"), on_activate
-        )
+            hotkey = keyboard.HotKey(
+                keyboard.HotKey.parse("<ctrl>+<shift>+g"), on_activate
+            )
 
-        def on_press(key):
-            hotkey.press(key)
+            def on_press(key):
+                hotkey.press(key)
 
-        def on_release(key):
-            hotkey.release(key)
+            def on_release(key):
+                hotkey.release(key)
 
-        listener = keyboard.Listener(on_press=on_press, on_release=on_release)
-        listener.daemon = True
-        listener.start()
+            listener = keyboard.Listener(on_press=on_press, on_release=on_release)
+            listener.daemon = True
+            listener.start()
+        except ImportError:
+            self.status_label.config(
+                text="⚠️ pynput не установлен — горячие клавиши отключены",
+                fg="#ffcc00",
+            )
+        except Exception as e:
+            print(f"Hotkey setup error: {e}")
 
     def toggle_capture(self):
         """Toggle auto-capture mode."""
@@ -238,33 +256,41 @@ class GeoGuessrSolver:
         """Auto scan every 3 seconds."""
         if not self.is_running:
             return
-        self.manual_scan()
+        self._do_scan_safe()
         self.root.after(3000, self._auto_scan_loop)
 
     def manual_scan(self):
         """Perform a single scan."""
         self.status_label.config(text="🔍 Сканирование...", fg="#ffcc00")
-        threading.Thread(target=self._do_scan, daemon=True).start()
+        self._do_scan_safe()
 
-    def _do_scan(self):
-        """Scan in background thread."""
-        try:
-            image = self.capture.grab_screen()
-            result = self.analyzer.analyze(image)
-            self.root.after(0, lambda: self._show_result(result))
-        except Exception as e:
-            self.root.after(
-                0,
-                lambda: self.status_label.config(
-                    text=f"❌ Ошибка: {str(e)}", fg="#ff4444"
-                ),
-            )
+    def _do_scan_safe(self):
+        """Run scan in background thread, safely update UI."""
+        def worker():
+            try:
+                image = self.capture.grab_screen()
+                result = self.analyzer.analyze(image)
+                self.root.after(0, lambda: self._show_result(result))
+            except Exception as e:
+                error_msg = str(e).split("\n")[0][:60]
+                self.root.after(
+                    0,
+                    lambda: self.status_label.config(
+                        text=f"❌ {error_msg}", fg="#ff4444"
+                    ),
+                )
+
+        thread = threading.Thread(target=worker, daemon=True)
+        thread.start()
 
     def _show_result(self, result):
         """Display analysis result in both main window and overlay."""
         # Update overlay (shows city/country on top of game)
         if self.overlay:
-            self.overlay.update(result)
+            try:
+                self.overlay.update(result)
+            except Exception:
+                pass
 
         # Update main window text
         self.result_text.config(state="normal")

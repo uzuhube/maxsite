@@ -2,6 +2,7 @@
 Overlay window for GeoGuessr Solver.
 Compact, transparent, always-on-top overlay that shows city/country.
 Designed to float over the game without blocking the view.
+Compatible with Python 3.14+ tkinter.
 """
 
 import tkinter as tk
@@ -25,15 +26,14 @@ class ResultOverlay:
         self.root.title("GeoSolver")
         self.root.geometry("280x90+30+30")
         self.root.attributes("-topmost", True)
-        self.root.attributes("-alpha", 0.75)  # 75% opacity - semi-transparent
-        self.root.overrideredirect(True)  # No window borders
+        self.root.attributes("-alpha", 0.75)
+        self.root.overrideredirect(True)
         self.root.configure(bg="#000000")
 
         # Make window draggable
         self._drag_data = {"x": 0, "y": 0}
         self.root.bind("<ButtonPress-1>", self._start_drag)
         self.root.bind("<B1-Motion>", self._on_drag)
-        # Right-click to close
         self.root.bind("<ButtonPress-3>", lambda e: self.hide())
 
         # Main frame with thin green border
@@ -63,7 +63,7 @@ class ResultOverlay:
             bg="#000000",
             anchor="w",
             padx=10,
-            pady=(0, 6),
+            pady=3,
         )
         self.subtitle_label.pack(fill="x")
 
@@ -77,7 +77,7 @@ class ResultOverlay:
             cursor="hand2",
             anchor="w",
             padx=10,
-            pady=(0, 4),
+            pady=4,
         )
         self.maps_label.pack(fill="x")
 
@@ -95,10 +95,8 @@ class ResultOverlay:
 
     def update(self, result: dict):
         """Update overlay with new result. Shows city/country prominently."""
-        # If we have coordinates, do reverse geocoding to get city/country
         if result.get("lat") and result.get("lng"):
             self.coords = (result["lat"], result["lng"])
-            # Show country from analysis immediately
             location_text = result.get("country", "Определение...")
             self.location_label.config(text=f"📍 {location_text}", fg="#00ff88")
 
@@ -139,7 +137,7 @@ class ResultOverlay:
         """Reverse geocode coordinates to get city/country name."""
         try:
             resp = requests.get(
-                f"https://nominatim.openstreetmap.org/reverse",
+                "https://nominatim.openstreetmap.org/reverse",
                 params={
                     "lat": lat,
                     "lon": lng,
@@ -155,7 +153,6 @@ class ResultOverlay:
             if data.get("address"):
                 addr = data["address"]
                 parts = []
-                # City/town
                 city = (
                     addr.get("city")
                     or addr.get("town")
@@ -164,22 +161,19 @@ class ResultOverlay:
                 )
                 if city:
                     parts.append(city)
-                # State/region
                 state = addr.get("state")
                 if state and state != city:
                     parts.append(state)
-                # Country
                 country = addr.get("country")
                 if country:
                     parts.append(country)
 
                 if parts:
                     location_text = ", ".join(parts)
-                    # Update UI from main thread
                     self.root.after(
                         0,
-                        lambda: self.location_label.config(
-                            text=f"📍 {location_text}", fg="#00ff88"
+                        lambda t=location_text: self.location_label.config(
+                            text=f"📍 {t}", fg="#00ff88"
                         ),
                     )
         except Exception:
