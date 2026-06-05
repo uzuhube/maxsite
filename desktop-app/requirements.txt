@@ -1,6 +1,8 @@
 Pillow>=10.0.0
-pytesseract>=0.3.10
 pynput>=1.7.6
 mss>=9.0.0
 requests>=2.31.0
-tkinter-tooltip>=3.1.0
+
+# Optional - install for OCR text recognition (better accuracy):
+# pytesseract>=0.3.10
+# Also requires: sudo apt install tesseract-ocr (Linux) or download from https://github.com/UB-Mannheim/tesseract/wiki (Windows)
