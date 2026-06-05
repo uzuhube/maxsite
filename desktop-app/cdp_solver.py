@@ -74,6 +74,7 @@ class CDPClient:
         self._last_coords = None
         self._running = False
         self._connected = False
+        self._network_log_count = 0  # Log first N network responses for debugging
 
     @property
     def connected(self):
@@ -228,6 +229,13 @@ class CDPClient:
         if method == "Network.responseReceived":
             request_id = params.get("requestId", "")
             url = params.get("response", {}).get("url", "")
+
+            # Log first 30 network responses for debugging
+            if self._network_log_count < 30 and url and not url.startswith("data:"):
+                self._network_log_count += 1
+                maps_marker = " ★ MAPS!" if "maps.googleapis" in url else ""
+                log("info", f"  NET [{self._network_log_count}]: {url[:90]}{maps_marker}")
+
             if self._is_maps_rpc(url):
                 self._rpc_requests[request_id] = url
                 log("data", f"Maps RPC: {url[:80]}")
@@ -249,11 +257,17 @@ class CDPClient:
 
     def _is_maps_rpc(self, url):
         """Check if URL is a Google Maps RPC request."""
-        return (
-            "maps.googleapis.com/$rpc" in url
-            or "maps.googleapis.com" in url
-            and ("SingleImageSearch" in url or "GeoPhotoService" in url or "$rpc" in url)
-        )
+        if "maps.googleapis.com/$rpc" in url:
+            return True
+        if "maps.googleapis.com" in url and (
+            "SingleImageSearch" in url or
+            "GeoPhotoService" in url or
+            "GetMetadata" in url or
+            "Streetview" in url or
+            "$rpc" in url
+        ):
+            return True
+        return False
 
     def _fetch_and_process_body(self, request_id):
         """Fetch response body and extract pano IDs."""
@@ -465,25 +479,21 @@ def find_target():
     def has_ws(t):
         return bool(t.get("webSocketDebuggerUrl"))
 
-    # Priority: game page/iframe > any geoguessr page > any page with ws
-    game_geo = [t for t in targets if is_geo(t) and is_game(t) and has_ws(t)]
-    any_geo = [t for t in targets if is_geo(t) and has_ws(t)]
-    any_page = [t for t in targets if t.get("type") == "page" and has_ws(t)]
+    # Priority (same as GeoHelper): iframe > page, game > any
+    # Network traffic for Maps RPC happens in the IFRAME, not the page shell
+    game_iframe = next((t for t in targets if t.get("type") == "iframe" and is_geo(t) and is_game(t) and has_ws(t)), None)
+    game_page = next((t for t in targets if t.get("type") == "page" and is_geo(t) and is_game(t) and has_ws(t)), None)
+    any_iframe = next((t for t in targets if t.get("type") == "iframe" and is_geo(t) and has_ws(t)), None)
+    any_page = next((t for t in targets if t.get("type") == "page" and is_geo(t) and has_ws(t)), None)
 
-    # Pick the best target
-    picked = None
-    if game_geo:
-        picked = game_geo[0]
-        log("ok", f"Цель: игровая страница GeoGuessr")
-    elif any_geo:
-        picked = any_geo[0]
-        log("ok", f"Цель: страница GeoGuessr")
-    elif any_page:
-        # Even non-geoguessr pages might be useful if it's the only game page
-        picked = any_page[0]
-        log("info", f"Цель: {picked.get('title', picked.get('url', ''))[:50]}")
+    # Pick in priority order: game iframe > game page > any iframe > any page
+    picked = game_iframe or game_page or any_iframe or any_page
 
-    if not picked:
+    if picked:
+        target_type = picked.get("type", "")
+        target_url = picked.get("url", "")[:60]
+        log("ok", f"Цель: [{target_type}] {target_url}")
+    else:
         return None, "no_geoguessr"
 
     # Fix WebSocket URL: force 127.0.0.1 instead of localhost (Windows IPv6 fix)
