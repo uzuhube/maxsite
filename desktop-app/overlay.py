@@ -1,86 +1,83 @@
 """
 Overlay window for GeoGuessr Solver.
-Shows results in an always-on-top transparent overlay.
+Compact, transparent, always-on-top overlay that shows city/country.
+Designed to float over the game without blocking the view.
 """
 
 import tkinter as tk
 import webbrowser
+import threading
+import requests
 
 
 class ResultOverlay:
-    """Always-on-top overlay window showing location results."""
+    """
+    Compact transparent always-on-top overlay.
+    Shows city/country name instead of raw coordinates.
+    """
 
-    def __init__(self):
-        self.root = tk.Toplevel()
+    def __init__(self, parent=None):
+        if parent:
+            self.root = tk.Toplevel(parent)
+        else:
+            self.root = tk.Tk()
+
         self.root.title("GeoSolver")
-        self.root.geometry("300x180+50+50")
+        self.root.geometry("280x90+30+30")
         self.root.attributes("-topmost", True)
-        self.root.configure(bg="#1a1a2e")
+        self.root.attributes("-alpha", 0.75)  # 75% opacity - semi-transparent
         self.root.overrideredirect(True)  # No window borders
+        self.root.configure(bg="#000000")
 
         # Make window draggable
         self._drag_data = {"x": 0, "y": 0}
         self.root.bind("<ButtonPress-1>", self._start_drag)
         self.root.bind("<B1-Motion>", self._on_drag)
+        # Right-click to close
+        self.root.bind("<ButtonPress-3>", lambda e: self.hide())
 
-        # Content
-        self.frame = tk.Frame(self.root, bg="#1a1a2e", relief="solid", bd=1)
-        self.frame.pack(fill="both", expand=True)
+        # Main frame with thin green border
+        self.frame = tk.Frame(self.root, bg="#000000")
+        self.frame.pack(fill="both", expand=True, padx=1, pady=1)
         self.frame.configure(highlightbackground="#00ff88", highlightthickness=1)
 
-        # Header
-        header = tk.Frame(self.frame, bg="#0d1117")
-        header.pack(fill="x")
-
-        tk.Label(
-            header,
-            text="📍 GeoSolver",
-            font=("Segoe UI", 11, "bold"),
-            fg="#00ff88",
-            bg="#0d1117",
-            padx=8,
-            pady=4,
-        ).pack(side="left")
-
-        # Close button
-        close_btn = tk.Label(
-            header,
-            text="✕",
-            font=("Segoe UI", 11),
-            fg="#888",
-            bg="#0d1117",
-            cursor="hand2",
-            padx=8,
-            pady=4,
-        )
-        close_btn.pack(side="right")
-        close_btn.bind("<Button-1>", lambda e: self.hide())
-
-        # Content area
-        self.content = tk.Label(
+        # Location label (city/country) - large, prominent
+        self.location_label = tk.Label(
             self.frame,
-            text="Ожидание...",
-            font=("Courier New", 10),
-            fg="#aaa",
-            bg="#1a1a2e",
-            justify="left",
-            anchor="nw",
-            wraplength=280,
-            padx=8,
-            pady=8,
+            text="⏳ Ожидание...",
+            font=("Segoe UI", 14, "bold"),
+            fg="#00ff88",
+            bg="#000000",
+            anchor="w",
+            padx=10,
+            pady=6,
         )
-        self.content.pack(fill="both", expand=True)
+        self.location_label.pack(fill="x")
 
-        # Maps link
+        # Subtitle (confidence + hint)
+        self.subtitle_label = tk.Label(
+            self.frame,
+            text="Ctrl+Shift+G для сканирования",
+            font=("Segoe UI", 9),
+            fg="#888888",
+            bg="#000000",
+            anchor="w",
+            padx=10,
+            pady=(0, 6),
+        )
+        self.subtitle_label.pack(fill="x")
+
+        # Maps link (subtle, bottom)
         self.maps_label = tk.Label(
             self.frame,
             text="",
-            font=("Segoe UI", 9),
+            font=("Segoe UI", 9, "underline"),
             fg="#4da6ff",
-            bg="#1a1a2e",
+            bg="#000000",
             cursor="hand2",
-            padx=8,
-            pady=4,
+            anchor="w",
+            padx=10,
+            pady=(0, 4),
         )
         self.maps_label.pack(fill="x")
 
@@ -97,27 +94,96 @@ class ResultOverlay:
         self.root.geometry(f"+{x}+{y}")
 
     def update(self, result: dict):
-        """Update overlay with new result."""
-        lines = []
-
-        if result.get("country"):
-            lines.append(f"🌍 {result['country']}")
-        if result.get("region"):
-            lines.append(f"📍 {result['region']}")
-        if result.get("confidence"):
-            lines.append(f"📊 {result['confidence']}%")
+        """Update overlay with new result. Shows city/country prominently."""
+        # If we have coordinates, do reverse geocoding to get city/country
         if result.get("lat") and result.get("lng"):
-            lines.append(f"📐 {result['lat']:.4f}, {result['lng']:.4f}")
             self.coords = (result["lat"], result["lng"])
-            self.maps_label.config(text="🗺️ Открыть в Maps")
+            # Show country from analysis immediately
+            location_text = result.get("country", "Определение...")
+            self.location_label.config(text=f"📍 {location_text}", fg="#00ff88")
+
+            # Reverse geocode in background for more detail
+            threading.Thread(
+                target=self._reverse_geocode,
+                args=(result["lat"], result["lng"]),
+                daemon=True,
+            ).start()
+
+            # Subtitle with confidence
+            confidence = result.get("confidence", 0)
+            clues = result.get("clues", [])
+            hint = clues[0] if clues else ""
+            self.subtitle_label.config(
+                text=f"Точность: {confidence}%  {hint[:30]}"
+            )
+
+            # Maps link
+            self.maps_label.config(text="🗺️ Открыть на карте")
             self.maps_label.bind("<Button-1>", self._open_maps)
 
-        if lines:
-            self.content.config(text="\n".join(lines), fg="#00ff88")
+        elif result.get("country"):
+            self.location_label.config(
+                text=f"📍 {result['country']}", fg="#00ff88"
+            )
+            confidence = result.get("confidence", 0)
+            self.subtitle_label.config(text=f"Точность: {confidence}%")
+            self.maps_label.config(text="")
         else:
-            self.content.config(text="Не определено", fg="#888")
+            self.location_label.config(text="❓ Не определено", fg="#ffcc00")
+            self.subtitle_label.config(text="Попробуйте другой ракурс")
+            self.maps_label.config(text="")
 
         self.show()
+
+    def _reverse_geocode(self, lat, lng):
+        """Reverse geocode coordinates to get city/country name."""
+        try:
+            resp = requests.get(
+                f"https://nominatim.openstreetmap.org/reverse",
+                params={
+                    "lat": lat,
+                    "lon": lng,
+                    "format": "json",
+                    "zoom": 10,
+                    "accept-language": "ru",
+                },
+                headers={"User-Agent": "GeoGuessrSolver/1.0"},
+                timeout=5,
+            )
+            data = resp.json()
+
+            if data.get("address"):
+                addr = data["address"]
+                parts = []
+                # City/town
+                city = (
+                    addr.get("city")
+                    or addr.get("town")
+                    or addr.get("village")
+                    or addr.get("municipality")
+                )
+                if city:
+                    parts.append(city)
+                # State/region
+                state = addr.get("state")
+                if state and state != city:
+                    parts.append(state)
+                # Country
+                country = addr.get("country")
+                if country:
+                    parts.append(country)
+
+                if parts:
+                    location_text = ", ".join(parts)
+                    # Update UI from main thread
+                    self.root.after(
+                        0,
+                        lambda: self.location_label.config(
+                            text=f"📍 {location_text}", fg="#00ff88"
+                        ),
+                    )
+        except Exception:
+            pass
 
     def _open_maps(self, event=None):
         if self.coords:
@@ -135,3 +201,7 @@ class ResultOverlay:
             self.hide()
         else:
             self.show()
+
+    def set_opacity(self, value):
+        """Set overlay opacity (0.0 - 1.0)."""
+        self.root.attributes("-alpha", value)
