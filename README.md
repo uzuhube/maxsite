@@ -4,8 +4,9 @@
 
 ## Компоненты
 
-### 1. Chrome Extension (Браузер)
+### 1. Browser Extension (Chrome / Firefox)
 Извлекает координаты напрямую из Google Maps API объектов на странице GeoGuessr.
+Поддерживает **Chrome** и **Firefox**.
 
 **Возможности:**
 - 🎯 100% точное определение координат (извлечение из API)
@@ -32,13 +33,26 @@ Python-приложение для анализа экрана с помощью
 
 ## Установка
 
-### Chrome Extension
+### Chrome
 
 1. Откройте `chrome://extensions/` в Chrome
 2. Включите "Режим разработчика" (Developer mode)
 3. Нажмите "Загрузить распакованное расширение" (Load unpacked)
 4. Выберите папку `chrome-extension/`
 5. Откройте GeoGuessr — расширение начнёт работать автоматически
+
+### Firefox
+
+1. Откройте `about:debugging#/runtime/this-firefox` в Firefox
+2. Нажмите "Загрузить временное дополнение" (Load Temporary Add-on)
+3. Выберите файл `firefox-extension/manifest.json`
+4. Откройте GeoGuessr — расширение начнёт работать автоматически
+
+> **Для постоянной установки:** упакуйте `firefox-extension/` в `.xpi` файл:
+> ```bash
+> cd firefox-extension && zip -r ../geoguessr-solver.xpi * && cd ..
+> ```
+> Затем установите через `about:addons` → "Установить дополнение из файла"
 
 ### Desktop App (для Steam)
 
@@ -114,19 +128,24 @@ python main.py
 
 ```
 geoguessr-solver/
-├── chrome-extension/       # Chrome расширение
-│   ├── manifest.json       # Manifest V3
-│   ├── content.js          # Контент-скрипт (извлечение координат)
-│   ├── background.js       # Service Worker
-│   ├── popup.html          # UI popup
-│   ├── popup.js            # Логика popup
-│   └── icons/              # Иконки расширения
-├── desktop-app/            # Python приложение
-│   ├── main.py             # Главный файл (GUI)
-│   ├── capture.py          # Захват экрана
-│   ├── analyzer.py         # Анализ изображений
-│   ├── overlay.py          # Overlay окно
-│   └── requirements.txt    # Зависимости Python
+├── chrome-extension/       # Chrome расширение (Manifest V3)
+│   ├── manifest.json
+│   ├── content.js
+│   ├── background.js
+│   ├── popup.html / popup.js
+│   └── icons/
+├── firefox-extension/      # Firefox расширение (Manifest V2)
+│   ├── manifest.json
+│   ├── content.js
+│   ├── background.js
+│   ├── popup.html / popup.js
+│   └── icons/
+├── desktop-app/            # Python приложение (Steam)
+│   ├── main.py
+│   ├── capture.py
+│   ├── analyzer.py
+│   ├── overlay.py
+│   └── requirements.txt
 └── README.md
 ```
 
