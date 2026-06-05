@@ -1,5 +1,14 @@
 @echo off
 chcp 65001 >nul 2>&1
+
+:: Request admin if not already
+net session >nul 2>&1
+if errorlevel 1 (
+    echo [*] Requesting admin privileges...
+    powershell -Command "Start-Process '%~f0' -Verb RunAs"
+    exit /b
+)
+
 echo.
 echo   ╔═══════════════════════════════════════════╗
 echo   ║  GeoSolver — CDP Mode (100%% accuracy)    ║
@@ -17,12 +26,6 @@ if errorlevel 1 (
 :: Install deps
 echo [*] Проверка зависимостей...
 pip install websocket-client requests >nul 2>&1
-if errorlevel 1 (
-    echo [!] Ошибка установки зависимостей
-    echo [*] Попробуйте: pip install websocket-client requests
-    pause
-    exit /b
-)
 
 echo [*] Зависимости OK
 echo.

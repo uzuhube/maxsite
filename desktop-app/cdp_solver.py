@@ -140,11 +140,35 @@ class CDPClient:
 
     def _run(self):
         """Main WebSocket connection loop."""
+        # Force IPv4 127.0.0.1 (Windows blocks IPv6 localhost WebSocket)
+        ws_url = self.ws_url.replace("localhost", "127.0.0.1")
+        log("info", f"Подключение к: {ws_url[:80]}")
+
         self.ws = websocket.WebSocket()
         self.ws.settimeout(1.0)
 
         try:
-            self.ws.connect(self.ws_url)
+            # Create a raw IPv4 socket first to avoid Windows permission issues
+            import socket
+            sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            sock.settimeout(5)
+
+            # Parse host:port from ws URL (ws://127.0.0.1:34788/devtools/...)
+            import urllib.parse
+            parsed = urllib.parse.urlparse(ws_url)
+            host = parsed.hostname or "127.0.0.1"
+            port = parsed.port or 34788
+
+            sock.connect((host, port))
+            sock.settimeout(1.0)
+
+            # Connect websocket over the existing socket
+            self.ws.connect(
+                ws_url,
+                socket=sock,
+                suppress_origin=True,
+                skip_utf8_validation=True,
+            )
             self._connected = True
             log("ok", "CDP WebSocket подключен")
 
@@ -169,7 +193,15 @@ class CDPClient:
                     break
 
         except Exception as e:
-            log("err", f"Не удалось подключиться: {e}")
+            error_str = str(e)
+            if "10013" in error_str:
+                log("err", f"Windows блокирует WebSocket соединение!")
+                log("err", f"Решения:")
+                log("err", f"  1. Запустите от имени администратора")
+                log("err", f"  2. Отключите антивирус/файрвол временно")
+                log("err", f"  3. Добавьте Python в исключения файрвола")
+            else:
+                log("err", f"Не удалось подключиться: {e}")
         finally:
             self._connected = False
             self._running = False
@@ -453,6 +485,11 @@ def find_target():
 
     if not picked:
         return None, "no_geoguessr"
+
+    # Fix WebSocket URL: force 127.0.0.1 instead of localhost (Windows IPv6 fix)
+    ws_url = picked.get("webSocketDebuggerUrl", "")
+    ws_url = ws_url.replace("localhost", "127.0.0.1")
+    picked["webSocketDebuggerUrl"] = ws_url
 
     return picked, "ok"
 
