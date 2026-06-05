@@ -25,7 +25,7 @@ if errorlevel 1 (
 
 :: Install deps
 echo [*] Проверка зависимостей...
-pip install websocket-client requests >nul 2>&1
+pip install websocket-client requests Pillow >nul 2>&1
 
 echo [*] Зависимости OK
 echo.

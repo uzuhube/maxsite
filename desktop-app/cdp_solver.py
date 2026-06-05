@@ -7,7 +7,7 @@ GeoGuessr network traffic and extract exact coordinates.
 Setup:
   1. Steam → GeoGuessr → Properties → Launch Options:
      --remote-debugging-port=34788 --remote-allow-origins=*
-  2. pip install websocket-client requests
+  2. pip install websocket-client requests Pillow
   3. python cdp_solver.py
 """
 
@@ -541,19 +541,69 @@ def reverse_geocode(lat, lng):
         return f"{lat:.4f}, {lng:.4f}"
 
 
+# ─── Map Tiles ────────────────────────────────────────────────────────────────
+
+import math
+import io
+
+def fetch_map_tile(lat, lng, zoom, size=130):
+    """Fetch a static map image from OSM tile server and return as PhotoImage-compatible bytes."""
+    try:
+        from PIL import Image, ImageDraw, ImageTk
+
+        # Convert lat/lng to tile coordinates
+        n = 2 ** zoom
+        x_tile = int((lng + 180.0) / 360.0 * n)
+        lat_rad = math.radians(lat)
+        y_tile = int((1.0 - math.asinh(math.tan(lat_rad)) / math.pi) / 2.0 * n)
+
+        # Fetch center tile
+        url = f"https://tile.openstreetmap.org/{zoom}/{x_tile}/{y_tile}.png"
+        resp = requests.get(url, headers={"User-Agent": "GeoSolver/2.0"}, timeout=5)
+        if resp.status_code != 200:
+            return None
+
+        tile = Image.open(io.BytesIO(resp.content)).convert("RGB")
+
+        # Calculate pixel offset within tile
+        x_frac = (lng + 180.0) / 360.0 * n - x_tile
+        y_frac = (1.0 - math.asinh(math.tan(lat_rad)) / math.pi) / 2.0 * n - y_tile
+        px = int(x_frac * 256)
+        py = int(y_frac * 256)
+
+        # Crop centered on the point
+        half = size // 2
+        # Pad tile if needed
+        padded = Image.new("RGB", (256 + size, 256 + size), (13, 13, 26))
+        padded.paste(tile, (half, half))
+        crop_x = px
+        crop_y = py
+        cropped = padded.crop((crop_x, crop_y, crop_x + size, crop_y + size))
+
+        # Draw red marker dot in center
+        draw = ImageDraw.Draw(cropped)
+        cx, cy = size // 2, size // 2
+        draw.ellipse([cx - 5, cy - 5, cx + 5, cy + 5], fill="#ef4444", outline="#ffffff")
+
+        return ImageTk.PhotoImage(cropped)
+    except Exception as e:
+        log("err", f"Ошибка загрузки карты z{zoom}: {e}")
+        return None
+
+
 # ─── GUI Overlay ──────────────────────────────────────────────────────────────
 
 def create_overlay():
-    """Create the overlay application."""
+    """Create the overlay application with mini-maps."""
     import tkinter as tk
 
     class SolverApp:
         def __init__(self):
             self.root = tk.Tk()
             self.root.title("GeoSolver")
-            self.root.geometry("380x130+50+50")
+            self.root.geometry("430x290+50+50")
             self.root.attributes("-topmost", True)
-            self.root.attributes("-alpha", 0.90)
+            self.root.attributes("-alpha", 0.92)
             self.root.overrideredirect(True)
             self.root.configure(bg="#0d0d1a")
 
@@ -580,11 +630,6 @@ def create_overlay():
                 fg="#a78bfa", bg="#13132b"
             ).pack(side="left")
 
-            self.status_text = tk.Label(
-                hdr, text="", font=("Segoe UI", 8),
-                fg="#666", bg="#13132b"
-            ).pack(side="left", padx=8)
-
             close_lbl = tk.Label(
                 hdr, text="✕", font=("Segoe UI", 10),
                 fg="#555", bg="#13132b", padx=8, cursor="hand2"
@@ -592,31 +637,62 @@ def create_overlay():
             close_lbl.pack(side="right")
             close_lbl.bind("<Button-1>", lambda e: self._quit())
 
-            # Location
+            # Location text
             self.loc_label = tk.Label(
                 self.frame, text="Запуск...",
-                font=("Segoe UI", 14, "bold"), fg="#e2e2ff",
-                bg="#0d0d1a", anchor="w", padx=10, pady=6,
-                wraplength=360, justify="left"
+                font=("Segoe UI", 13, "bold"), fg="#e2e2ff",
+                bg="#0d0d1a", anchor="w", padx=10, pady=4,
+                wraplength=410, justify="left"
             )
             self.loc_label.pack(fill="x")
 
-            # Coords + link
-            bottom = tk.Frame(self.frame, bg="#0d0d1a")
-            bottom.pack(fill="x")
+            # Coords + link row
+            info_row = tk.Frame(self.frame, bg="#0d0d1a")
+            info_row.pack(fill="x")
 
             self.coords_label = tk.Label(
-                bottom, text="", font=("Consolas", 9),
+                info_row, text="", font=("Consolas", 9),
                 fg="#555577", bg="#0d0d1a", anchor="w", padx=10
             )
             self.coords_label.pack(side="left")
 
             self.maps_link = tk.Label(
-                bottom, text="", font=("Segoe UI", 9, "underline"),
+                info_row, text="", font=("Segoe UI", 9, "underline"),
                 fg="#7c3aed", bg="#0d0d1a", cursor="hand2", padx=10
             )
             self.maps_link.pack(side="right")
             self.maps_link.bind("<Button-1>", lambda e: self._open_maps())
+
+            # Maps row (3 mini-maps: city, country, continent)
+            maps_frame = tk.Frame(self.frame, bg="#0d0d1a")
+            maps_frame.pack(fill="x", padx=6, pady=4)
+
+            # City map (zoom 12)
+            city_col = tk.Frame(maps_frame, bg="#0d0d1a")
+            city_col.pack(side="left", padx=2)
+            tk.Label(city_col, text="Город", font=("Segoe UI", 8),
+                     fg="#666", bg="#0d0d1a").pack()
+            self.map_city = tk.Label(city_col, bg="#1a1a2e", width=130, height=130)
+            self.map_city.pack()
+
+            # Country map (zoom 5)
+            country_col = tk.Frame(maps_frame, bg="#0d0d1a")
+            country_col.pack(side="left", padx=2)
+            tk.Label(country_col, text="Страна", font=("Segoe UI", 8),
+                     fg="#666", bg="#0d0d1a").pack()
+            self.map_country = tk.Label(country_col, bg="#1a1a2e", width=130, height=130)
+            self.map_country.pack()
+
+            # Continent map (zoom 2)
+            cont_col = tk.Frame(maps_frame, bg="#0d0d1a")
+            cont_col.pack(side="left", padx=2)
+            tk.Label(cont_col, text="Континент", font=("Segoe UI", 8),
+                     fg="#666", bg="#0d0d1a").pack()
+            self.map_cont = tk.Label(cont_col, bg="#1a1a2e", width=130, height=130)
+            self.map_cont.pack()
+
+            # Keep references to images (prevent GC)
+            self._map_images = [None, None, None]
 
             # State
             self.coords = None
@@ -684,6 +760,10 @@ def create_overlay():
             self._set_state("connected", "Подключено! Ожидание раунда...")
             self._reconnect_count = 0
 
+            # Stop old CDP if any
+            if self.cdp:
+                self.cdp.stop()
+
             self.cdp = CDPClient(ws_url, self._on_coords)
             self.cdp.start()
 
@@ -692,8 +772,7 @@ def create_overlay():
 
         def _schedule_reconnect(self, delay_ms):
             self._reconnect_count += 1
-            # Exponential backoff up to 10s
-            actual_delay = min(delay_ms * (1.5 ** min(self._reconnect_count, 5)), 10000)
+            actual_delay = min(delay_ms * (1.2 ** min(self._reconnect_count, 8)), 8000)
             self.root.after(int(actual_delay), self._connect)
 
         def _check_health(self):
@@ -701,10 +780,13 @@ def create_overlay():
             if not self.cdp or not self.cdp.connected:
                 log("info", "Соединение потеряно, переподключение...")
                 self._set_state("searching", "Переподключение...")
+                if self.cdp:
+                    self.cdp.stop()
                 self.cdp = None
-                self.root.after(2000, self._connect)
+                self._reconnect_count = 0
+                self.root.after(1500, self._connect)
             else:
-                self.root.after(5000, self._check_health)
+                self.root.after(3000, self._check_health)
 
         def _on_coords(self, lat, lng):
             """Called from CDP thread when coordinates are found."""
@@ -715,11 +797,14 @@ def create_overlay():
             """Update UI with new coordinates."""
             self.coords_label.config(text=f"{lat:.5f}, {lng:.5f}")
             self.maps_link.config(text="Google Maps →")
-            self.loc_label.config(text="Определяю город...", fg="#a78bfa")
+            self.loc_label.config(text="Определяю...", fg="#a78bfa")
 
-            # Geocode in background
+            # Geocode + load maps in background
             threading.Thread(
                 target=self._do_geocode, args=(lat, lng), daemon=True
+            ).start()
+            threading.Thread(
+                target=self._load_maps, args=(lat, lng), daemon=True
             ).start()
 
         def _do_geocode(self, lat, lng):
@@ -727,6 +812,15 @@ def create_overlay():
             self.root.after(0, lambda: self.loc_label.config(
                 text=f"📍 {location}", fg="#e2e2ff"
             ))
+
+        def _load_maps(self, lat, lng):
+            """Load three map tiles at different zoom levels."""
+            zooms = [(12, self.map_city, 0), (5, self.map_country, 1), (2, self.map_cont, 2)]
+            for zoom, widget, idx in zooms:
+                img = fetch_map_tile(lat, lng, zoom)
+                if img:
+                    self._map_images[idx] = img
+                    self.root.after(0, lambda w=widget, i=img: w.config(image=i))
 
         def _open_maps(self):
             if self.coords:
