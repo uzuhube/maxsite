@@ -1,0 +1,137 @@
+# 🌍 GeoGuessr Solver
+
+Автоматическое распознавание места для GeoGuessr. Работает как в **браузере**, так и в **Steam** приложении. Без AI API — все анализы выполняются локально.
+
+## Компоненты
+
+### 1. Chrome Extension (Браузер)
+Извлекает координаты напрямую из Google Maps API объектов на странице GeoGuessr.
+
+**Возможности:**
+- 🎯 100% точное определение координат (извлечение из API)
+- 🗺️ Ссылка на Google Maps
+- 📍 Оверлей с координатами прямо на странице
+- 🔄 Автоматическое обновление при смене раунда
+- 📋 Копирование координат в буфер обмена
+- 🌐 Обратное геокодирование (показывает страну/город)
+
+### 2. Desktop App (Steam / Любое приложение)
+Python-приложение для анализа экрана с помощью OCR и визуальных эвристик.
+
+**Возможности:**
+- 📷 Захват экрана по горячей клавише (Ctrl+Shift+G)
+- 🔤 OCR распознавание текста (вывески, знаки, номера)
+- 🌐 Определение языка → страна
+- 🛑 Анализ дорожных знаков и маркеров
+- 📞 Распознавание телефонных кодов
+- 🌐 Поиск доменных имен
+- 🎨 Анализ визуальных особенностей (цвет почвы, растительность)
+- 🚗 Определение стороны движения
+
+---
+
+## Установка
+
+### Chrome Extension
+
+1. Откройте `chrome://extensions/` в Chrome
+2. Включите "Режим разработчика" (Developer mode)
+3. Нажмите "Загрузить распакованное расширение" (Load unpacked)
+4. Выберите папку `chrome-extension/`
+5. Откройте GeoGuessr — расширение начнёт работать автоматически
+
+### Desktop App (для Steam)
+
+**Требования:**
+- Python 3.10+
+- Tesseract OCR
+
+**Linux:**
+```bash
+sudo apt-get install tesseract-ocr tesseract-ocr-rus tesseract-ocr-jpn tesseract-ocr-kor
+cd desktop-app
+pip install -r requirements.txt
+python main.py
+```
+
+**Windows:**
+```bash
+# Установите Tesseract: https://github.com/UB-Mannheim/tesseract/wiki
+# Добавьте в PATH
+
+cd desktop-app
+pip install -r requirements.txt
+python main.py
+```
+
+**macOS:**
+```bash
+brew install tesseract tesseract-lang
+cd desktop-app
+pip install -r requirements.txt
+python main.py
+```
+
+---
+
+## Использование
+
+### Chrome Extension
+1. Установите расширение
+2. Откройте игру на [geoguessr.com](https://www.geoguessr.com)
+3. Координаты будут отображаться автоматически в оверлее и в popup расширения
+
+### Desktop App
+1. Запустите `python main.py`
+2. Откройте GeoGuessr (Steam или браузер)
+3. Нажмите **Ctrl+Shift+G** или кнопку "Scan Now"
+4. Результат появится в окне приложения
+
+---
+
+## Как это работает
+
+### Chrome Extension
+- Перехватывает XHR/Fetch запросы к Google Maps API
+- Парсит ответы для извлечения координат
+- Пытается напрямую обратиться к Google Maps Panorama объекту
+- Отображает координаты в оверлее на странице
+
+### Desktop App
+Анализирует скриншот по нескольким параметрам:
+
+| Метод | Точность | Описание |
+|-------|----------|----------|
+| OCR + язык | Высокая | Определяет язык текста на вывесках |
+| Текстовые маркеры | Высокая | STOP/PARE/ALTO, названия улиц |
+| Домены | Очень высокая | .ru, .br, .jp на вывесках |
+| Телефоны | Высокая | Код страны +7, +1, +44 |
+| Визуальные | Низкая | Цвет почвы, растительность |
+
+---
+
+## Структура проекта
+
+```
+geoguessr-solver/
+├── chrome-extension/       # Chrome расширение
+│   ├── manifest.json       # Manifest V3
+│   ├── content.js          # Контент-скрипт (извлечение координат)
+│   ├── background.js       # Service Worker
+│   ├── popup.html          # UI popup
+│   ├── popup.js            # Логика popup
+│   └── icons/              # Иконки расширения
+├── desktop-app/            # Python приложение
+│   ├── main.py             # Главный файл (GUI)
+│   ├── capture.py          # Захват экрана
+│   ├── analyzer.py         # Анализ изображений
+│   ├── overlay.py          # Overlay окно
+│   └── requirements.txt    # Зависимости Python
+└── README.md
+```
+
+---
+
+## Лицензия
+
+MIT
