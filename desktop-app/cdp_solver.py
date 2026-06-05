@@ -67,14 +67,18 @@ class CDPClient:
         self.ws = None
         self._msg_id = 0
         self._lock = threading.Lock()
-        self._responses = {}  # msg_id -> threading.Event, result
+        self._responses = {}  # msg_id -> threading.Event
         self._response_data = {}  # msg_id -> result data
-        self._rpc_requests = {}  # request_id -> url
+        self._rpc_requests = {}  # request_id -> url (max 20)
         self._resolved_panos = set()
         self._last_coords = None
         self._running = False
         self._connected = False
-        self._network_log_count = 0  # Log first N network responses for debugging
+        self._network_log_count = 0
+        self._coords_found_this_round = False  # Debounce: 1 result per round
+        self._last_result_time = 0  # Debounce timer
+        self._active_threads = 0  # Limit concurrent threads
+        self._max_threads = 2
 
     @property
     def connected(self):
@@ -230,11 +234,11 @@ class CDPClient:
             request_id = params.get("requestId", "")
             url = params.get("response", {}).get("url", "")
 
-            # Log first 30 network responses for debugging
-            if self._network_log_count < 30 and url and not url.startswith("data:"):
+            # Log first 10 network responses for debugging
+            if self._network_log_count < 10 and url and not url.startswith("data:"):
                 self._network_log_count += 1
-                maps_marker = " ★ MAPS!" if "maps.googleapis" in url else ""
-                log("info", f"  NET [{self._network_log_count}]: {url[:90]}{maps_marker}")
+                maps_marker = " <MAPS>" if "maps.googleapis" in url else ""
+                log("info", f"  NET [{self._network_log_count}]: {url[:70]}{maps_marker}")
 
             if self._is_maps_rpc(url):
                 self._rpc_requests[request_id] = url
@@ -244,7 +248,13 @@ class CDPClient:
             request_id = params.get("requestId", "")
             if request_id in self._rpc_requests:
                 del self._rpc_requests[request_id]
-                # Fetch body in background
+                # Skip if we already have coords for this round (debounce)
+                if self._coords_found_this_round:
+                    return
+                # Limit concurrent processing threads
+                if self._active_threads >= self._max_threads:
+                    return
+                self._active_threads += 1
                 threading.Thread(
                     target=self._fetch_and_process_body,
                     args=(request_id,),
@@ -271,45 +281,74 @@ class CDPClient:
 
     def _fetch_and_process_body(self, request_id):
         """Fetch response body and extract pano IDs."""
-        result = self._send_command(
-            "Network.getResponseBody",
-            {"requestId": request_id},
-            timeout=5,
-        )
-        if not result:
-            return
-
-        body = result.get("body", "")
-        if result.get("base64Encoded"):
-            try:
-                body = base64.b64decode(body).decode("utf-8", errors="ignore")
-            except Exception:
+        try:
+            if self._coords_found_this_round:
                 return
 
-        if not body:
-            return
+            result = self._send_command(
+                "Network.getResponseBody",
+                {"requestId": request_id},
+                timeout=5,
+            )
+            if not result:
+                return
 
-        # Try to extract pano IDs
-        panos = self._extract_panos(body)
-        if panos:
-            log("data", f"Найдено {len(panos)} pano ID: {panos[0][:20]}...")
-            for pano_id in panos[:3]:
+            body = result.get("body", "")
+            if result.get("base64Encoded"):
+                try:
+                    body = base64.b64decode(body).decode("utf-8", errors="ignore")
+                except Exception:
+                    return
+
+            if not body:
+                return
+
+            # Try direct coordinate extraction first (fastest)
+            coords = self._extract_coords_direct(body)
+            if coords:
+                lat, lng = coords
+                if self._validate_coords(lat, lng):
+                    self._emit_coords(lat, lng)
+                    return
+
+            # Try pano IDs (only resolve first one)
+            panos = self._extract_panos(body)
+            if panos:
+                pano_id = panos[0]
                 if pano_id not in self._resolved_panos:
                     self._resolved_panos.add(pano_id)
-                    threading.Thread(
-                        target=self._resolve_pano,
-                        args=(pano_id,),
-                        daemon=True,
-                    ).start()
+                    log("data", f"Pano ID: {pano_id[:24]}...")
+                    self._resolve_pano(pano_id)  # Run in same thread (no new thread)
+        finally:
+            self._active_threads = max(0, self._active_threads - 1)
 
-        # Also try direct coordinate extraction
-        coords = self._extract_coords_direct(body)
-        if coords:
-            lat, lng = coords
-            if self._validate_coords(lat, lng):
-                log("ok", f"Координаты из тела: {lat:.5f}, {lng:.5f}")
-                self._last_coords = (lat, lng)
-                self.on_coords(lat, lng)
+    def _emit_coords(self, lat, lng):
+        """Emit coordinates with debounce (max 1 per 3 seconds)."""
+        now = time.time()
+        if now - self._last_result_time < 3.0:
+            return
+        self._last_result_time = now
+        self._coords_found_this_round = True
+        self._last_coords = (lat, lng)
+        log("ok", f"КООРДИНАТЫ: {lat:.6f}, {lng:.6f}")
+        self.on_coords(lat, lng)
+        # Reset debounce after 5 seconds (for next round)
+        threading.Timer(5.0, self._reset_round).start()
+
+    def _reset_round(self):
+        """Allow new coordinates after round change."""
+        self._coords_found_this_round = False
+        # Clean up old data to prevent memory buildup
+        if len(self._resolved_panos) > 50:
+            self._resolved_panos.clear()
+        if len(self._rpc_requests) > 20:
+            self._rpc_requests.clear()
+        if len(self._responses) > 10:
+            # Clean stale responses
+            stale = [k for k, v in self._responses.items() if v.is_set()]
+            for k in stale:
+                self._responses.pop(k, None)
+                self._response_data.pop(k, None)
 
     def _extract_panos(self, text):
         """Extract panorama IDs from response text."""
@@ -412,9 +451,7 @@ class CDPClient:
         lat = parsed.get("lat")
         lng = parsed.get("lng")
         if lat is not None and lng is not None and self._validate_coords(lat, lng):
-            log("ok", f"КООРДИНАТЫ: {lat:.6f}, {lng:.6f}")
-            self._last_coords = (lat, lng)
-            self.on_coords(lat, lng)
+            self._emit_coords(lat, lng)
 
     def _validate_coords(self, lat, lng):
         """Check if coordinates are valid and different from last."""
@@ -546,24 +583,45 @@ def reverse_geocode(lat, lng):
 import math
 import io
 
-def fetch_map_tile(lat, lng, zoom, size=130):
-    """Fetch a static map image from OSM tile server and return as PhotoImage-compatible bytes."""
+# Simple tile cache to avoid re-downloading
+_tile_cache = {}  # (zoom, x, y) -> bytes
+_tile_session = None
+
+
+def _get_tile_session():
+    global _tile_session
+    if _tile_session is None:
+        _tile_session = requests.Session()
+        _tile_session.headers["User-Agent"] = "GeoSolver/2.0"
+    return _tile_session
+
+
+def fetch_map_tile(lat, lng, zoom, size=120):
+    """Fetch a static map image from OSM tile server. Uses cache."""
     try:
         from PIL import Image, ImageDraw, ImageTk
 
-        # Convert lat/lng to tile coordinates
         n = 2 ** zoom
         x_tile = int((lng + 180.0) / 360.0 * n)
         lat_rad = math.radians(lat)
         y_tile = int((1.0 - math.asinh(math.tan(lat_rad)) / math.pi) / 2.0 * n)
 
-        # Fetch center tile
-        url = f"https://tile.openstreetmap.org/{zoom}/{x_tile}/{y_tile}.png"
-        resp = requests.get(url, headers={"User-Agent": "GeoSolver/2.0"}, timeout=5)
-        if resp.status_code != 200:
-            return None
+        cache_key = (zoom, x_tile, y_tile)
+        if cache_key in _tile_cache:
+            tile_bytes = _tile_cache[cache_key]
+        else:
+            url = f"https://tile.openstreetmap.org/{zoom}/{x_tile}/{y_tile}.png"
+            sess = _get_tile_session()
+            resp = sess.get(url, timeout=4)
+            if resp.status_code != 200:
+                return None
+            tile_bytes = resp.content
+            # Cache (limit to 30 tiles)
+            if len(_tile_cache) > 30:
+                _tile_cache.clear()
+            _tile_cache[cache_key] = tile_bytes
 
-        tile = Image.open(io.BytesIO(resp.content)).convert("RGB")
+        tile = Image.open(io.BytesIO(tile_bytes)).convert("RGB")
 
         # Calculate pixel offset within tile
         x_frac = (lng + 180.0) / 360.0 * n - x_tile
@@ -573,21 +631,18 @@ def fetch_map_tile(lat, lng, zoom, size=130):
 
         # Crop centered on the point
         half = size // 2
-        # Pad tile if needed
         padded = Image.new("RGB", (256 + size, 256 + size), (13, 13, 26))
         padded.paste(tile, (half, half))
-        crop_x = px
-        crop_y = py
-        cropped = padded.crop((crop_x, crop_y, crop_x + size, crop_y + size))
+        cropped = padded.crop((px, py, px + size, py + size))
 
-        # Draw red marker dot in center
+        # Draw red marker
         draw = ImageDraw.Draw(cropped)
         cx, cy = size // 2, size // 2
-        draw.ellipse([cx - 5, cy - 5, cx + 5, cy + 5], fill="#ef4444", outline="#ffffff")
+        draw.ellipse([cx - 4, cy - 4, cx + 4, cy + 4], fill="#ef4444", outline="#ffffff")
 
         return ImageTk.PhotoImage(cropped)
     except Exception as e:
-        log("err", f"Ошибка загрузки карты z{zoom}: {e}")
+        log("err", f"Карта z{zoom}: {e}")
         return None
 
 
@@ -601,7 +656,7 @@ def create_overlay():
         def __init__(self):
             self.root = tk.Tk()
             self.root.title("GeoSolver")
-            self.root.geometry("430x290+50+50")
+            self.root.geometry("410x280+50+50")
             self.root.attributes("-topmost", True)
             self.root.attributes("-alpha", 0.92)
             self.root.overrideredirect(True)
@@ -667,12 +722,14 @@ def create_overlay():
             maps_frame = tk.Frame(self.frame, bg="#0d0d1a")
             maps_frame.pack(fill="x", padx=6, pady=4)
 
+            MAP_SIZE = 120
+
             # City map (zoom 12)
             city_col = tk.Frame(maps_frame, bg="#0d0d1a")
             city_col.pack(side="left", padx=2)
             tk.Label(city_col, text="Город", font=("Segoe UI", 8),
                      fg="#666", bg="#0d0d1a").pack()
-            self.map_city = tk.Label(city_col, bg="#1a1a2e", width=130, height=130)
+            self.map_city = tk.Canvas(city_col, bg="#1a1a2e", width=MAP_SIZE, height=MAP_SIZE, highlightthickness=0)
             self.map_city.pack()
 
             # Country map (zoom 5)
@@ -680,7 +737,7 @@ def create_overlay():
             country_col.pack(side="left", padx=2)
             tk.Label(country_col, text="Страна", font=("Segoe UI", 8),
                      fg="#666", bg="#0d0d1a").pack()
-            self.map_country = tk.Label(country_col, bg="#1a1a2e", width=130, height=130)
+            self.map_country = tk.Canvas(country_col, bg="#1a1a2e", width=MAP_SIZE, height=MAP_SIZE, highlightthickness=0)
             self.map_country.pack()
 
             # Continent map (zoom 2)
@@ -688,7 +745,7 @@ def create_overlay():
             cont_col.pack(side="left", padx=2)
             tk.Label(cont_col, text="Континент", font=("Segoe UI", 8),
                      fg="#666", bg="#0d0d1a").pack()
-            self.map_cont = tk.Label(cont_col, bg="#1a1a2e", width=130, height=130)
+            self.map_cont = tk.Canvas(cont_col, bg="#1a1a2e", width=MAP_SIZE, height=MAP_SIZE, highlightthickness=0)
             self.map_cont.pack()
 
             # Keep references to images (prevent GC)
@@ -814,13 +871,25 @@ def create_overlay():
             ))
 
         def _load_maps(self, lat, lng):
-            """Load three map tiles at different zoom levels."""
+            """Load three map tiles in parallel."""
+            import concurrent.futures
+
             zooms = [(12, self.map_city, 0), (5, self.map_country, 1), (2, self.map_cont, 2)]
-            for zoom, widget, idx in zooms:
+
+            def load_one(zoom, widget, idx):
                 img = fetch_map_tile(lat, lng, zoom)
                 if img:
                     self._map_images[idx] = img
-                    self.root.after(0, lambda w=widget, i=img: w.config(image=i))
+                    self.root.after(0, lambda w=widget, i=img: self._set_map(w, i))
+
+            with concurrent.futures.ThreadPoolExecutor(max_workers=3) as pool:
+                for z, w, i in zooms:
+                    pool.submit(load_one, z, w, i)
+
+        def _set_map(self, canvas, img):
+            """Set image on canvas widget."""
+            canvas.delete("all")
+            canvas.create_image(60, 60, image=img)
 
         def _open_maps(self):
             if self.coords:
