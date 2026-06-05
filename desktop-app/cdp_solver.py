@@ -7,15 +7,8 @@ GeoGuessr network traffic and extract exact coordinates.
 Setup:
   1. Steam → GeoGuessr → Properties → Launch Options:
      --remote-debugging-port=34788 --remote-allow-origins=*
-  2. pip install websocket-client requests Pillow
+  2. pip install websocket-client requests
   3. python cdp_solver.py
-
-How it works:
-  - Connects to localhost:34788 (Steam's embedded Chromium)
-  - Monitors network for Google Maps RPC responses
-  - Extracts panorama IDs from responses
-  - Resolves pano IDs to lat/lng via StreetViewService
-  - Shows city/country in a transparent overlay
 """
 
 import json
@@ -25,14 +18,14 @@ import time
 import threading
 import webbrowser
 import base64
-from collections import deque
+import traceback
 
 import requests
 
 try:
     import websocket
 except ImportError:
-    print("[!] Missing: pip install websocket-client")
+    print("[!] Нужно: pip install websocket-client")
     sys.exit(1)
 
 # ─── Configuration ───────────────────────────────────────────────────────────
@@ -41,7 +34,7 @@ CDP_PORT = 34788
 CDP_TARGET_URL = f"http://localhost:{CDP_PORT}/json"
 NOMINATIM_URL = "https://nominatim.openstreetmap.org/reverse"
 
-# Regex patterns for extracting panorama IDs from RPC responses
+# Panorama ID patterns (from GeoHelper's approach)
 PANO_PATTERNS = [
     re.compile(r'\[2,\s*"([A-Za-z0-9_:\-]{16,96})"'),
     re.compile(r'\[2,\s*\\"([A-Za-z0-9_:\-]{16,96})\\"'),
@@ -49,237 +42,351 @@ PANO_PATTERNS = [
     re.compile(r'(?i)(?:pano|panoid|pano_id|panoId)":"([A-Za-z0-9_:\-]{16,96})"'),
 ]
 
-# URLs that indicate Google Maps RPC traffic
-MAPS_RPC_MARKERS = ["maps.googleapis.com/$rpc", "maps.googleapis.com"]
+# Direct coordinate patterns (backup)
+COORD_PATTERNS = [
+    re.compile(r'\[\[null,null,(-?\d+\.\d{4,}),(-?\d+\.\d{4,})\]'),
+    re.compile(r'"lat"\s*:\s*(-?\d+\.\d{4,}).*?"lng"\s*:\s*(-?\d+\.\d{4,})'),
+]
+
+
+# ─── Logging ──────────────────────────────────────────────────────────────────
+
+def log(level, msg):
+    prefix = {"info": "[*]", "ok": "[+]", "err": "[!]", "data": "[>]"}
+    print(f"{prefix.get(level, '[?]')} {msg}")
 
 
 # ─── CDP Connection ──────────────────────────────────────────────────────────
 
-class CDPConnection:
-    """Manages WebSocket connection to Chrome DevTools Protocol."""
+class CDPClient:
+    """Synchronous CDP client using websocket-client with threading."""
 
-    def __init__(self, ws_url, on_coords_callback):
+    def __init__(self, ws_url, on_coords):
         self.ws_url = ws_url
-        self.on_coords = on_coords_callback
+        self.on_coords = on_coords
         self.ws = None
-        self.msg_id = 0
-        self.pending = {}
-        self.rpc_requests = {}  # request_id -> url
-        self.last_coords = None
-        self.resolved_panos = set()
-        self.pano_queue = deque()
+        self._msg_id = 0
         self._lock = threading.Lock()
+        self._responses = {}  # msg_id -> threading.Event, result
+        self._response_data = {}  # msg_id -> result data
+        self._rpc_requests = {}  # request_id -> url
+        self._resolved_panos = set()
+        self._last_coords = None
         self._running = False
+        self._connected = False
 
-    def connect(self):
-        """Connect and start listening."""
+    @property
+    def connected(self):
+        return self._connected
+
+    def start(self):
+        """Start connection in background thread."""
         self._running = True
-        self.ws = websocket.WebSocketApp(
-            self.ws_url,
-            on_message=self._on_message,
-            on_error=self._on_error,
-            on_close=self._on_close,
-            on_open=self._on_open,
-        )
-        self.ws.run_forever()
+        thread = threading.Thread(target=self._run, daemon=True)
+        thread.start()
 
     def stop(self):
         self._running = False
+        self._connected = False
         if self.ws:
-            self.ws.close()
+            try:
+                self.ws.close()
+            except Exception:
+                pass
 
-    def _send(self, method, params=None):
-        """Send a CDP command and return its ID."""
+    def _next_id(self):
         with self._lock:
-            self.msg_id += 1
-            msg_id = self.msg_id
-        msg = {"id": msg_id, "method": method, "params": params or {}}
-        self.ws.send(json.dumps(msg))
+            self._msg_id += 1
+            return self._msg_id
+
+    def _send_command(self, method, params=None, timeout=10):
+        """Send CDP command and wait for response."""
+        if not self.ws or not self._connected:
+            return None
+
+        msg_id = self._next_id()
+        event = threading.Event()
+        self._responses[msg_id] = event
+        self._response_data[msg_id] = None
+
+        payload = json.dumps({"id": msg_id, "method": method, "params": params or {}})
+        try:
+            self.ws.send(payload)
+        except Exception:
+            self._responses.pop(msg_id, None)
+            return None
+
+        if event.wait(timeout=timeout):
+            result = self._response_data.pop(msg_id, None)
+            self._responses.pop(msg_id, None)
+            return result
+        else:
+            self._responses.pop(msg_id, None)
+            self._response_data.pop(msg_id, None)
+            return None
+
+    def _send_command_async(self, method, params=None):
+        """Send CDP command without waiting for response (fire-and-forget)."""
+        if not self.ws or not self._connected:
+            return None
+
+        msg_id = self._next_id()
+        payload = json.dumps({"id": msg_id, "method": method, "params": params or {}})
+        try:
+            self.ws.send(payload)
+        except Exception:
+            pass
         return msg_id
 
-    def _on_open(self, ws):
-        """Enable network monitoring."""
-        self._send("Network.enable")
-        # Check if Google Maps is ready
-        threading.Thread(target=self._prewarm_google_maps, daemon=True).start()
+    def _run(self):
+        """Main WebSocket connection loop."""
+        self.ws = websocket.WebSocket()
+        self.ws.settimeout(1.0)
 
-    def _on_error(self, ws, error):
-        pass
-
-    def _on_close(self, ws, close_code, close_msg):
-        self._running = False
-
-    def _on_message(self, ws, message):
-        """Handle incoming CDP messages."""
         try:
-            data = json.loads(message)
+            self.ws.connect(self.ws_url)
+            self._connected = True
+            log("ok", "CDP WebSocket подключен")
+
+            # Enable network monitoring
+            self._send_command("Network.enable")
+            log("info", "Network мониторинг включен")
+
+            # Main read loop
+            while self._running:
+                try:
+                    data = self.ws.recv()
+                    if data:
+                        self._handle_message(data)
+                except websocket.WebSocketTimeoutException:
+                    continue
+                except websocket.WebSocketConnectionClosedException:
+                    log("err", "WebSocket соединение закрыто")
+                    break
+                except Exception as e:
+                    if self._running:
+                        log("err", f"WebSocket ошибка: {e}")
+                    break
+
+        except Exception as e:
+            log("err", f"Не удалось подключиться: {e}")
+        finally:
+            self._connected = False
+            self._running = False
+
+    def _handle_message(self, raw):
+        """Process incoming CDP message."""
+        try:
+            data = json.loads(raw)
         except json.JSONDecodeError:
             return
 
         # Response to our command
         if "id" in data:
             msg_id = data["id"]
-            if msg_id in self.pending:
-                callback = self.pending.pop(msg_id)
-                callback(data.get("result", {}))
+            if msg_id in self._responses:
+                self._response_data[msg_id] = data.get("result")
+                self._responses[msg_id].set()
             return
 
-        # Event from CDP
+        # CDP Event
         method = data.get("method", "")
         params = data.get("params", {})
 
         if method == "Network.responseReceived":
-            self._handle_response(params)
+            request_id = params.get("requestId", "")
+            url = params.get("response", {}).get("url", "")
+            if self._is_maps_rpc(url):
+                self._rpc_requests[request_id] = url
+                log("data", f"Maps RPC: {url[:80]}")
+
         elif method == "Network.loadingFinished":
-            self._handle_loading_finished(params)
+            request_id = params.get("requestId", "")
+            if request_id in self._rpc_requests:
+                del self._rpc_requests[request_id]
+                # Fetch body in background
+                threading.Thread(
+                    target=self._fetch_and_process_body,
+                    args=(request_id,),
+                    daemon=True,
+                ).start()
+
         elif method == "Network.loadingFailed":
             request_id = params.get("requestId", "")
-            self.rpc_requests.pop(request_id, None)
+            self._rpc_requests.pop(request_id, None)
 
-    def _handle_response(self, params):
-        """Remember RPC responses for later body fetching."""
-        request_id = params.get("requestId", "")
-        response = params.get("response", {})
-        url = response.get("url", "")
+    def _is_maps_rpc(self, url):
+        """Check if URL is a Google Maps RPC request."""
+        return (
+            "maps.googleapis.com/$rpc" in url
+            or "maps.googleapis.com" in url
+            and ("SingleImageSearch" in url or "GeoPhotoService" in url or "$rpc" in url)
+        )
 
-        if any(marker in url for marker in MAPS_RPC_MARKERS):
-            self.rpc_requests[request_id] = url
-
-    def _handle_loading_finished(self, params):
-        """Fetch body of completed RPC requests."""
-        request_id = params.get("requestId", "")
-        if request_id not in self.rpc_requests:
+    def _fetch_and_process_body(self, request_id):
+        """Fetch response body and extract pano IDs."""
+        result = self._send_command(
+            "Network.getResponseBody",
+            {"requestId": request_id},
+            timeout=5,
+        )
+        if not result:
             return
-        del self.rpc_requests[request_id]
 
-        # Fetch response body
-        def on_body(result):
-            body = result.get("body", "")
-            if result.get("base64Encoded"):
-                try:
-                    body = base64.b64decode(body).decode("utf-8", errors="ignore")
-                except Exception:
-                    return
-            if body:
-                self._extract_and_resolve_panos(body)
+        body = result.get("body", "")
+        if result.get("base64Encoded"):
+            try:
+                body = base64.b64decode(body).decode("utf-8", errors="ignore")
+            except Exception:
+                return
 
-        msg_id = self._send("Network.getResponseBody", {"requestId": request_id})
-        self.pending[msg_id] = on_body
+        if not body:
+            return
 
-    def _extract_and_resolve_panos(self, text):
+        # Try to extract pano IDs
+        panos = self._extract_panos(body)
+        if panos:
+            log("data", f"Найдено {len(panos)} pano ID: {panos[0][:20]}...")
+            for pano_id in panos[:3]:
+                if pano_id not in self._resolved_panos:
+                    self._resolved_panos.add(pano_id)
+                    threading.Thread(
+                        target=self._resolve_pano,
+                        args=(pano_id,),
+                        daemon=True,
+                    ).start()
+
+        # Also try direct coordinate extraction
+        coords = self._extract_coords_direct(body)
+        if coords:
+            lat, lng = coords
+            if self._validate_coords(lat, lng):
+                log("ok", f"Координаты из тела: {lat:.5f}, {lng:.5f}")
+                self._last_coords = (lat, lng)
+                self.on_coords(lat, lng)
+
+    def _extract_panos(self, text):
         """Extract panorama IDs from response text."""
         seen = set()
         panos = []
         for pattern in PANO_PATTERNS:
             for match in pattern.finditer(text):
                 pano_id = match.group(1)
-                if pano_id not in seen and pano_id not in self.resolved_panos:
+                if pano_id not in seen:
                     seen.add(pano_id)
                     panos.append(pano_id)
+        return panos
 
-        if panos:
-            # Resolve first new pano
-            for pano in panos[:3]:
-                threading.Thread(
-                    target=self._resolve_pano, args=(pano,), daemon=True
-                ).start()
+    def _extract_coords_direct(self, text):
+        """Try to extract coordinates directly from response body."""
+        for pattern in COORD_PATTERNS:
+            match = pattern.search(text)
+            if match:
+                try:
+                    lat = float(match.group(1))
+                    lng = float(match.group(2))
+                    if self._validate_coords(lat, lng):
+                        return (lat, lng)
+                except (ValueError, IndexError):
+                    continue
+        return None
 
     def _resolve_pano(self, pano_id):
-        """Resolve a panorama ID to coordinates using StreetViewService."""
-        if pano_id in self.resolved_panos:
-            return
-        self.resolved_panos.add(pano_id)
-
-        # Build JavaScript to resolve pano
-        escaped_pano = json.dumps(pano_id)
-        script = f"""new Promise(resolve => {{
+        """Resolve panorama ID to coordinates via StreetViewService."""
+        escaped = json.dumps(pano_id)
+        script = f"""
+(function() {{
   try {{
     if (!window.google || !window.google.maps || !window.google.maps.StreetViewService) {{
-      resolve(JSON.stringify({{ error: 'GOOGLE_MAPS_NOT_READY' }}));
-      return;
+      return JSON.stringify({{error: 'MAPS_NOT_READY'}});
     }}
-    const sv = new window.google.maps.StreetViewService();
-    sv.getPanorama({{ pano: {escaped_pano} }}, (data, status) => {{
-      if (status === 'OK' && data && data.location && data.location.latLng) {{
-        resolve(JSON.stringify({{
-          lat: data.location.latLng.lat(),
-          lng: data.location.latLng.lng(),
-          description: data.location.description || ''
-        }}));
-      }} else {{
-        resolve(JSON.stringify({{ error: status || 'NO_DATA' }}));
-      }}
+    return new Promise(function(resolve) {{
+      var sv = new window.google.maps.StreetViewService();
+      sv.getPanorama({{pano: {escaped}}}, function(data, status) {{
+        if (status === 'OK' && data && data.location && data.location.latLng) {{
+          resolve(JSON.stringify({{
+            lat: data.location.latLng.lat(),
+            lng: data.location.latLng.lng(),
+            desc: data.location.description || ''
+          }}));
+        }} else {{
+          resolve(JSON.stringify({{error: status || 'NO_DATA'}}));
+        }}
+      }});
     }});
-  }} catch (err) {{
-    resolve(JSON.stringify({{ error: err.message }}));
+  }} catch(e) {{
+    return JSON.stringify({{error: e.message}});
   }}
-}})"""
+}})()"""
 
-        # Send evaluate command
-        result_event = threading.Event()
-        result_data = [None]
-
-        def on_result(result):
-            value = result.get("result", {}).get("value", "")
-            result_data[0] = value
-            result_event.set()
-
-        msg_id = self._send(
+        result = self._send_command(
             "Runtime.evaluate",
             {
                 "expression": script,
                 "returnByValue": True,
                 "awaitPromise": True,
             },
+            timeout=8,
         )
-        self.pending[msg_id] = on_result
 
-        # Wait for result (max 5 seconds)
-        if result_event.wait(timeout=5):
-            raw = result_data[0]
-            if raw:
-                try:
-                    data = json.loads(raw)
-                    if "lat" in data and "lng" in data:
-                        lat, lng = data["lat"], data["lng"]
-                        if self._is_valid_coords(lat, lng):
-                            self.last_coords = (lat, lng)
-                            self.on_coords(lat, lng, data.get("description", ""))
-                except (json.JSONDecodeError, KeyError):
-                    pass
+        if not result:
+            log("err", f"Pano resolve timeout: {pano_id[:20]}")
+            return
 
-    def _is_valid_coords(self, lat, lng):
-        """Validate coordinates."""
+        raw_value = ""
+        res = result.get("result", {})
+        if res.get("type") == "string":
+            raw_value = res.get("value", "")
+        elif res.get("value"):
+            raw_value = str(res.get("value", ""))
+
+        if not raw_value:
+            # Try exceptionDetails
+            exc = result.get("exceptionDetails")
+            if exc:
+                log("err", f"JS ошибка: {exc.get('text', 'unknown')}")
+            return
+
+        try:
+            parsed = json.loads(raw_value)
+        except json.JSONDecodeError:
+            log("err", f"Не удалось разобрать ответ: {raw_value[:60]}")
+            return
+
+        if "error" in parsed:
+            error = parsed["error"]
+            if error == "MAPS_NOT_READY":
+                log("info", "Google Maps ещё не загружен в игре")
+                # Remove from resolved so we can retry later
+                self._resolved_panos.discard(pano_id)
+            else:
+                log("info", f"Pano resolve: {error}")
+            return
+
+        lat = parsed.get("lat")
+        lng = parsed.get("lng")
+        if lat is not None and lng is not None and self._validate_coords(lat, lng):
+            log("ok", f"КООРДИНАТЫ: {lat:.6f}, {lng:.6f}")
+            self._last_coords = (lat, lng)
+            self.on_coords(lat, lng)
+
+    def _validate_coords(self, lat, lng):
+        """Check if coordinates are valid and different from last."""
         if not (-90 <= lat <= 90 and -180 <= lng <= 180):
             return False
         if lat == 0 and lng == 0:
             return False
-        # Check if significantly different from last position
-        if self.last_coords:
-            prev_lat, prev_lng = self.last_coords
+        if self._last_coords:
+            prev_lat, prev_lng = self._last_coords
             if abs(lat - prev_lat) < 0.0001 and abs(lng - prev_lng) < 0.0001:
                 return False
         return True
 
-    def _prewarm_google_maps(self):
-        """Check if Google Maps is loaded in the page."""
-        time.sleep(1)
-        script = "Boolean(window.google && window.google.maps && window.google.maps.StreetViewService)"
-        for _ in range(10):
-            try:
-                msg_id = self._send(
-                    "Runtime.evaluate",
-                    {"expression": script, "returnByValue": True},
-                )
-                time.sleep(0.5)
-            except Exception:
-                time.sleep(1)
-
 
 # ─── Target Discovery ────────────────────────────────────────────────────────
 
-def find_geoguessr_target():
-    """Find GeoGuessr page in CDP targets."""
+def find_target():
+    """Find the best CDP target for GeoGuessr."""
     try:
         resp = requests.get(CDP_TARGET_URL, timeout=4)
     except requests.ConnectionError:
@@ -287,45 +394,73 @@ def find_geoguessr_target():
     except requests.Timeout:
         return None, "timeout"
 
-    text = resp.text
+    text = resp.text.strip()
+
+    # Check for missing --remote-allow-origins=*
     if "WebSockets request was expected" in text or "400 Bad Request" in text:
         return None, "missing_origins"
 
     try:
         targets = resp.json()
-    except json.JSONDecodeError:
+    except (json.JSONDecodeError, ValueError):
         return None, "missing_origins"
 
-    # Priority: game iframe > game page > any geoguessr
+    if not isinstance(targets, list):
+        return None, "invalid_response"
+
+    log("info", f"Найдено {len(targets)} CDP targets")
+
+    # Log all targets for debugging
+    for t in targets:
+        title = t.get("title", "")[:40]
+        url = t.get("url", "")[:60]
+        ttype = t.get("type", "")
+        has_ws = bool(t.get("webSocketDebuggerUrl"))
+        log("info", f"  [{ttype}] {title or url} {'(ws)' if has_ws else ''}")
+
     def is_geo(t):
-        url = t.get("url", "")
-        title = t.get("title", "")
-        return "geoguessr.com" in url or "GeoGuessr" in title
+        url = t.get("url", "").lower()
+        title = t.get("title", "").lower()
+        return "geoguessr" in url or "geoguessr" in title
 
     def is_game(t):
         url = t.get("url", "").lower()
-        return any(x in url for x in ["/game", "/duels", "/battle", "/challenge", "/quiz", "/play"])
+        return any(x in url for x in [
+            "/game/", "/duels/", "/battle/", "/challenge/",
+            "/quiz/", "/play/", "/game?", "/round"
+        ])
 
-    game_targets = [t for t in targets if is_geo(t) and is_game(t) and t.get("webSocketDebuggerUrl")]
-    geo_targets = [t for t in targets if is_geo(t) and t.get("webSocketDebuggerUrl")]
+    def has_ws(t):
+        return bool(t.get("webSocketDebuggerUrl"))
 
-    # Prefer iframe type for game
-    for t in game_targets:
-        if t.get("type") == "iframe":
-            return t, "ok"
-    for t in game_targets:
-        if t.get("type") == "page":
-            return t, "ok"
-    for t in geo_targets:
-        return t, "ok"
+    # Priority: game page/iframe > any geoguessr page > any page with ws
+    game_geo = [t for t in targets if is_geo(t) and is_game(t) and has_ws(t)]
+    any_geo = [t for t in targets if is_geo(t) and has_ws(t)]
+    any_page = [t for t in targets if t.get("type") == "page" and has_ws(t)]
 
-    return None, "no_geoguessr"
+    # Pick the best target
+    picked = None
+    if game_geo:
+        picked = game_geo[0]
+        log("ok", f"Цель: игровая страница GeoGuessr")
+    elif any_geo:
+        picked = any_geo[0]
+        log("ok", f"Цель: страница GeoGuessr")
+    elif any_page:
+        # Even non-geoguessr pages might be useful if it's the only game page
+        picked = any_page[0]
+        log("info", f"Цель: {picked.get('title', picked.get('url', ''))[:50]}")
+
+    if not picked:
+        return None, "no_geoguessr"
+
+    return picked, "ok"
 
 
 # ─── Reverse Geocoding ────────────────────────────────────────────────────────
 
 def reverse_geocode(lat, lng):
-    """Get city/country from coordinates via Nominatim."""
+    """Get city/country name from coordinates."""
     try:
         resp = requests.get(
             NOMINATIM_URL,
@@ -336,14 +471,16 @@ def reverse_geocode(lat, lng):
                 "zoom": 10,
                 "accept-language": "ru",
             },
-            headers={"User-Agent": "GeoGuessrSolver/2.0"},
+            headers={"User-Agent": "GeoSolver/2.0"},
             timeout=5,
         )
         data = resp.json()
         addr = data.get("address", {})
-
         parts = []
-        city = addr.get("city") or addr.get("town") or addr.get("village") or addr.get("municipality")
+        city = (
+            addr.get("city") or addr.get("town") or
+            addr.get("village") or addr.get("municipality")
+        )
         if city:
             parts.append(city)
         state = addr.get("state")
@@ -352,132 +489,103 @@ def reverse_geocode(lat, lng):
         country = addr.get("country")
         if country:
             parts.append(country)
-
-        return ", ".join(parts) if parts else None
+        return ", ".join(parts) if parts else f"{lat:.4f}, {lng:.4f}"
     except Exception:
-        return None
+        return f"{lat:.4f}, {lng:.4f}"
 
 
 # ─── GUI Overlay ──────────────────────────────────────────────────────────────
 
 def create_overlay():
-    """Create the main overlay window."""
+    """Create the overlay application."""
     import tkinter as tk
 
-    class SolverOverlay:
+    class SolverApp:
         def __init__(self):
             self.root = tk.Tk()
             self.root.title("GeoSolver")
-            self.root.geometry("360x140+50+50")
+            self.root.geometry("380x130+50+50")
             self.root.attributes("-topmost", True)
-            self.root.attributes("-alpha", 0.88)
+            self.root.attributes("-alpha", 0.90)
             self.root.overrideredirect(True)
-            self.root.configure(bg="#0f0f1a")
+            self.root.configure(bg="#0d0d1a")
 
             # Dragging
-            self._drag_x = 0
-            self._drag_y = 0
-            self.root.bind("<ButtonPress-1>", self._start_drag)
-            self.root.bind("<B1-Motion>", self._on_drag)
-            self.root.bind("<ButtonPress-3>", lambda e: self._quit())
+            self._dx = 0
+            self._dy = 0
+            self.root.bind("<ButtonPress-1>", self._drag_start)
+            self.root.bind("<B1-Motion>", self._drag_move)
 
-            # Main frame with border
-            self.frame = tk.Frame(self.root, bg="#0f0f1a")
+            # Main frame
+            self.frame = tk.Frame(self.root, bg="#0d0d1a")
             self.frame.pack(fill="both", expand=True, padx=2, pady=2)
-            self.frame.configure(highlightbackground="#6c3bff", highlightthickness=2)
+            self.frame.configure(highlightbackground="#7c3aed", highlightthickness=2)
 
-            # Header bar
-            header_frame = tk.Frame(self.frame, bg="#161625")
-            header_frame.pack(fill="x")
+            # Header
+            hdr = tk.Frame(self.frame, bg="#13132b")
+            hdr.pack(fill="x")
 
-            self.status_dot = tk.Label(
-                header_frame,
-                text="●",
-                font=("Segoe UI", 8),
-                fg="#ff4444",
-                bg="#161625",
-                padx=6,
+            self.dot = tk.Label(hdr, text="●", font=("Arial", 9), fg="#ef4444", bg="#13132b")
+            self.dot.pack(side="left", padx=6)
+
+            tk.Label(
+                hdr, text="GeoSolver", font=("Segoe UI", 9, "bold"),
+                fg="#a78bfa", bg="#13132b"
+            ).pack(side="left")
+
+            self.status_text = tk.Label(
+                hdr, text="", font=("Segoe UI", 8),
+                fg="#666", bg="#13132b"
+            ).pack(side="left", padx=8)
+
+            close_lbl = tk.Label(
+                hdr, text="✕", font=("Segoe UI", 10),
+                fg="#555", bg="#13132b", padx=8, cursor="hand2"
             )
-            self.status_dot.pack(side="left")
+            close_lbl.pack(side="right")
+            close_lbl.bind("<Button-1>", lambda e: self._quit())
 
-            self.header = tk.Label(
-                header_frame,
-                text="GeoSolver",
-                font=("Segoe UI", 9, "bold"),
-                fg="#a78bfa",
-                bg="#161625",
-                anchor="w",
+            # Location
+            self.loc_label = tk.Label(
+                self.frame, text="Запуск...",
+                font=("Segoe UI", 14, "bold"), fg="#e2e2ff",
+                bg="#0d0d1a", anchor="w", padx=10, pady=6,
+                wraplength=360, justify="left"
             )
-            self.header.pack(side="left", fill="x", expand=True)
+            self.loc_label.pack(fill="x")
 
-            close_btn = tk.Label(
-                header_frame,
-                text="✕",
-                font=("Segoe UI", 9),
-                fg="#666",
-                bg="#161625",
-                padx=8,
-                cursor="hand2",
-            )
-            close_btn.pack(side="right")
-            close_btn.bind("<Button-1>", lambda e: self._quit())
+            # Coords + link
+            bottom = tk.Frame(self.frame, bg="#0d0d1a")
+            bottom.pack(fill="x")
 
-            # Location display
-            self.location_label = tk.Label(
-                self.frame,
-                text="Ожидание подключения...",
-                font=("Segoe UI", 15, "bold"),
-                fg="#ffffff",
-                bg="#0f0f1a",
-                anchor="w",
-                padx=10,
-                pady=6,
-                wraplength=340,
-                justify="left",
-            )
-            self.location_label.pack(fill="x")
-
-            # Coords subtitle
             self.coords_label = tk.Label(
-                self.frame,
-                text="",
-                font=("Consolas", 9),
-                fg="#666688",
-                bg="#0f0f1a",
-                anchor="w",
-                padx=10,
-                pady=2,
+                bottom, text="", font=("Consolas", 9),
+                fg="#555577", bg="#0d0d1a", anchor="w", padx=10
             )
-            self.coords_label.pack(fill="x")
+            self.coords_label.pack(side="left")
 
-            # Maps link
-            self.maps_label = tk.Label(
-                self.frame,
-                text="",
-                font=("Segoe UI", 9, "underline"),
-                fg="#6c3bff",
-                bg="#0f0f1a",
-                cursor="hand2",
-                anchor="w",
-                padx=10,
-                pady=2,
+            self.maps_link = tk.Label(
+                bottom, text="", font=("Segoe UI", 9, "underline"),
+                fg="#7c3aed", bg="#0d0d1a", cursor="hand2", padx=10
             )
-            self.maps_label.pack(fill="x")
+            self.maps_link.pack(side="right")
+            self.maps_link.bind("<Button-1>", lambda e: self._open_maps())
 
+            # State
             self.coords = None
-            self.cdp_thread = None
             self.cdp = None
+            self._reconnect_count = 0
 
-            # Start CDP connection loop
-            self.root.after(500, self._connect_loop)
+            # Start connection loop
+            self.root.after(300, self._connect)
 
-        def _start_drag(self, event):
-            self._drag_x = event.x
-            self._drag_y = event.y
+        def _drag_start(self, e):
+            self._dx = e.x
+            self._dy = e.y
 
-        def _on_drag(self, event):
-            x = self.root.winfo_x() + event.x - self._drag_x
-            y = self.root.winfo_y() + event.y - self._drag_y
+        def _drag_move(self, e):
+            x = self.root.winfo_x() + e.x - self._dx
+            y = self.root.winfo_y() + e.y - self._dy
             self.root.geometry(f"+{x}+{y}")
 
         def _quit(self):
@@ -485,120 +593,125 @@ def create_overlay():
                 self.cdp.stop()
             self.root.destroy()
 
-        def _connect_loop(self):
-            """Try to connect to CDP."""
-            target, status = find_geoguessr_target()
+        def _set_state(self, state, text):
+            colors = {
+                "connected": "#22c55e",
+                "searching": "#f59e0b",
+                "error": "#ef4444",
+            }
+            self.dot.config(fg=colors.get(state, "#666"))
+            self.loc_label.config(text=text, fg="#888899")
+            self.coords_label.config(text="")
+            self.maps_link.config(text="")
+
+        def _connect(self):
+            """Try to find and connect to GeoGuessr."""
+            self._set_state("searching", "Поиск GeoGuessr...")
+
+            target, status = find_target()
 
             if status == "not_running":
-                self._set_status("disconnected", "Steam не запущен или нет флагов CDP")
-                self.root.after(3000, self._connect_loop)
+                self._set_state("error", "Steam не запущен или нет флагов CDP")
+                self._schedule_reconnect(4000)
                 return
             elif status == "missing_origins":
-                self._set_status("error", "Добавьте --remote-allow-origins=*")
-                self.root.after(3000, self._connect_loop)
+                self._set_state("error", "Нужен флаг --remote-allow-origins=*")
+                self._schedule_reconnect(4000)
                 return
             elif status == "no_geoguessr":
-                self._set_status("waiting", "Запустите GeoGuessr в Steam")
-                self.root.after(2000, self._connect_loop)
+                self._set_state("searching", "Откройте GeoGuessr в Steam")
+                self._schedule_reconnect(2000)
                 return
-            elif status == "timeout":
-                self._set_status("disconnected", "Таймаут подключения к CDP")
-                self.root.after(3000, self._connect_loop)
+            elif status != "ok":
+                self._set_state("error", f"Ошибка: {status}")
+                self._schedule_reconnect(3000)
                 return
 
-            # Connected!
+            # Connect to target
             ws_url = target.get("webSocketDebuggerUrl", "")
-            title = target.get("title", "") or target.get("url", "")
-            self._set_status("connected", f"Подключено: {title[:40]}")
+            if not ws_url:
+                self._set_state("error", "Нет WebSocket URL")
+                self._schedule_reconnect(3000)
+                return
 
-            self.cdp = CDPConnection(ws_url, self._on_coords_found)
-            self.cdp_thread = threading.Thread(target=self.cdp.connect, daemon=True)
-            self.cdp_thread.start()
+            self._set_state("connected", "Подключено! Ожидание раунда...")
+            self._reconnect_count = 0
 
-            # Monitor connection
-            self.root.after(5000, self._check_connection)
+            self.cdp = CDPClient(ws_url, self._on_coords)
+            self.cdp.start()
 
-        def _check_connection(self):
-            """Check if CDP is still connected."""
-            if self.cdp and not self.cdp._running:
-                self._set_status("disconnected", "Соединение потеряно")
+            # Monitor connection health
+            self.root.after(3000, self._check_health)
+
+        def _schedule_reconnect(self, delay_ms):
+            self._reconnect_count += 1
+            # Exponential backoff up to 10s
+            actual_delay = min(delay_ms * (1.5 ** min(self._reconnect_count, 5)), 10000)
+            self.root.after(int(actual_delay), self._connect)
+
+        def _check_health(self):
+            """Check if CDP connection is still alive."""
+            if not self.cdp or not self.cdp.connected:
+                log("info", "Соединение потеряно, переподключение...")
+                self._set_state("searching", "Переподключение...")
                 self.cdp = None
-                self.root.after(3000, self._connect_loop)
+                self.root.after(2000, self._connect)
             else:
-                self.root.after(5000, self._check_connection)
+                self.root.after(5000, self._check_health)
 
-        def _on_coords_found(self, lat, lng, description=""):
-            """Called from CDP thread when coords are found."""
+        def _on_coords(self, lat, lng):
+            """Called from CDP thread when coordinates are found."""
             self.coords = (lat, lng)
-            # Update UI from main thread
-            self.root.after(0, lambda: self._update_location(lat, lng, description))
+            self.root.after(0, lambda: self._show_coords(lat, lng))
 
-        def _update_location(self, lat, lng, description=""):
-            """Update overlay with new location."""
+        def _show_coords(self, lat, lng):
+            """Update UI with new coordinates."""
             self.coords_label.config(text=f"{lat:.5f}, {lng:.5f}")
-            self.maps_label.config(text="🗺 Открыть Google Maps")
-            self.maps_label.bind("<Button-1>", lambda e: self._open_maps())
+            self.maps_link.config(text="Google Maps →")
+            self.loc_label.config(text="Определяю город...", fg="#a78bfa")
 
-            if description:
-                self.location_label.config(text=f"📍 {description}", fg="#e0e0ff")
-            else:
-                self.location_label.config(text="📍 Определяю...", fg="#aaaacc")
-
-            # Reverse geocode in background
+            # Geocode in background
             threading.Thread(
-                target=self._geocode, args=(lat, lng), daemon=True
+                target=self._do_geocode, args=(lat, lng), daemon=True
             ).start()
 
-        def _geocode(self, lat, lng):
-            """Reverse geocode and update label."""
+        def _do_geocode(self, lat, lng):
             location = reverse_geocode(lat, lng)
-            if location:
-                self.root.after(
-                    0, lambda: self.location_label.config(text=f"📍 {location}", fg="#e0e0ff")
-                )
+            self.root.after(0, lambda: self.loc_label.config(
+                text=f"📍 {location}", fg="#e2e2ff"
+            ))
 
         def _open_maps(self):
             if self.coords:
-                url = f"https://www.google.com/maps?q={self.coords[0]},{self.coords[1]}"
-                webbrowser.open(url)
-
-        def _set_status(self, state, text):
-            """Update status indicator."""
-            colors = {
-                "connected": "#00ff88",
-                "waiting": "#ffaa00",
-                "disconnected": "#ff4444",
-                "error": "#ff4444",
-            }
-            self.status_dot.config(fg=colors.get(state, "#888"))
-            self.location_label.config(text=text, fg="#888899")
-            self.coords_label.config(text="")
-            self.maps_label.config(text="")
+                webbrowser.open(
+                    f"https://www.google.com/maps/@{self.coords[0]},{self.coords[1]},14z"
+                )
 
         def run(self):
             self.root.mainloop()
 
-    return SolverOverlay()
+    return SolverApp()
 
 
 # ─── Main ─────────────────────────────────────────────────────────────────────
 
 def main():
-    print("=" * 50)
-    print("  GeoSolver — CDP Mode (100% accuracy)")
-    print("=" * 50)
     print()
-    print("Настройка Steam:")
+    print("  ╔═══════════════════════════════════════════╗")
+    print("  ║  GeoSolver — CDP Mode (100% accuracy)    ║")
+    print("  ╚═══════════════════════════════════════════╝")
+    print()
+    print("  Настройка Steam:")
     print("  GeoGuessr → Свойства → Параметры запуска:")
     print("  --remote-debugging-port=34788 --remote-allow-origins=*")
     print()
-    print("Управление:")
-    print("  ЛКМ — перетащить оверлей")
-    print("  ПКМ — закрыть")
+    print("  ЛКМ — перетащить | ПКМ или ✕ — закрыть")
+    print()
+    print("─" * 50)
     print()
 
-    overlay = create_overlay()
-    overlay.run()
+    app = create_overlay()
+    app.run()
 
 
 if __name__ == "__main__":
